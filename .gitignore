@@ -1,0 +1,35 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+dist-electron
+dist-test
+*.local
+
+# Build artifacts & caches (曾经被误提交，勿再跟踪)
+release/
+.cache/
+.electron-builder-cache/
+.electron-userdata/
+.sea-build-7za/
+tmp-asar-check*/
+*.tmp.exe
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

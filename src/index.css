@@ -1,0 +1,210 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+:root, html.dark {
+  --bg-primary: #010409;
+  --bg-secondary: #0d1117;
+  --bg-tertiary: #161b22;
+  --bg-hover: #21262d;
+  --bg-active: #30363d;
+  --bg-selected: rgba(31, 111, 235, 0.2);
+  --text-primary: #c9d1d9;
+  --text-secondary: #8b949e;
+  --text-tertiary: #6e7681;
+  --text-link: #58a6ff;
+  --border-primary: rgba(240, 246, 252, 0.18);
+  --border-secondary: rgba(240, 246, 252, 0.12);
+  --accent: #1f6feb;
+  --accent-hover: #388bfd;
+  --accent-text: #79c0ff;
+  --accent-20: rgba(31, 111, 235, 0.2);
+  --success: #238636;
+  --success-hover: #2ea043;
+  --success-text: #3fb950;
+  --success-10: rgba(35, 134, 54, 0.1);
+  --danger: #da3633;
+  --danger-text: #f85149;
+  --danger-10: rgba(218, 54, 51, 0.1);
+  --warning: #d29922;
+  --warning-text: #d29922;
+  --warning-10: rgba(210, 153, 34, 0.1);
+  --terminal-bg: #0d1117;
+  --terminal-text: #c9d1d9;
+  --terminal-cursor: #58a6ff;
+  --scrollbar-thumb: #30363d;
+  --scrollbar-thumb-hover: #484f58;
+  --hover-bg: rgba(33, 38, 45, 0.7);
+  --overlay: rgba(0, 0, 0, 0.6);
+  --code-bg: rgba(0, 0, 0, 0.4);
+  --code-border: rgba(255, 255, 255, 0.1);
+  --modal-bg: #0d1117;
+  --dropdown-bg: #1c2128;
+}
+
+html.light {
+  --bg-primary: #f6f8fa;
+  --bg-secondary: #eef2f6;
+  --bg-tertiary: #e6eaf0;
+  --bg-hover: #d8e0e8;
+  --bg-active: #c9d2db;
+  --bg-selected: rgba(9, 105, 218, 0.18);
+  --text-primary: #1f2328;
+  --text-secondary: #58616b;
+  --text-tertiary: #6e7781;
+  --text-link: #0969da;
+  --border-primary: rgba(31, 39, 49, 0.08);
+  --border-secondary: rgba(31, 39, 49, 0.04);
+  --accent: #0969da;
+  --accent-hover: #0860c7;
+  --accent-text: #0969da;
+  --accent-20: rgba(9, 105, 218, 0.22);
+  --success: #1a7f37;
+  --success-hover: #116329;
+  --success-text: #1a7f37;
+  --success-10: rgba(26, 127, 55, 0.1);
+  --danger: #cf222e;
+  --danger-text: #cf222e;
+  --danger-10: rgba(207, 34, 46, 0.1);
+  --warning: #9a6700;
+  --warning-text: #9a6700;
+  --warning-10: rgba(154, 103, 0, 0.1);
+  --terminal-bg: #ffffff;
+  --terminal-text: #24292f;
+  --terminal-cursor: #0969da;
+  --scrollbar-thumb: #d0d7de;
+  --scrollbar-thumb-hover: #afb8c1;
+  --hover-bg: rgba(216, 224, 232, 0.8);
+  --overlay: rgba(0, 0, 0, 0.45);
+  --code-bg: rgba(0, 0, 0, 0.06);
+  --code-border: rgba(0, 0, 0, 0.12);
+  --modal-bg: #ffffff;
+  --dropdown-bg: #f0f2f5;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+html.light {
+  color-scheme: light;
+}
+html.dark {
+  color-scheme: dark;
+}
+
+.xterm {
+  position: relative;
+  background-color: var(--terminal-bg) !important;
+}
+
+.xterm .xterm-screen,
+.xterm .xterm-viewport {
+  background-color: var(--terminal-bg) !important;
+}
+
+.xterm-viewport::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+.xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+/* 静止时隐藏：默认透明；鼠标进入 viewport 或正在滚动时显现 */
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 2px;
+  transition: background 0.15s ease;
+}
+.xterm-viewport:hover::-webkit-scrollbar-thumb,
+.xterm-viewport.is-scrolling::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+}
+.xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+input, textarea, select {
+  color-scheme: inherit;
+}
+
+select {
+  background-color: var(--bg-secondary);
+  color: var(--text-primary);
+  border-color: var(--border-primary);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@-webkit-keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.animate-pulse {
+  animation: pulse 1.5s infinite;
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.2s ease-out;
+}
+
+/* 终端光标闪烁（DOM 渲染器方案）：
+   - xterm 原生 blink 已关闭（options.cursorBlink=false），否则聚焦/失焦切换时
+     xterm 会整行重绘光标所在行，导致邻字因 subpixel 抗锯齿位移而忽明忽暗。
+   - 改为用 CSS 动画强制 .xterm-cursor（真实 DOM 节点）周期性显隐，稳定闪烁且不依赖焦点。
+   - 用 will-change:opacity 把光标提升为独立合成层：opacity 动画只在合成层重绘光标自身，
+     绝不牵连邻字，从根本上消除「后面字符忽现忽看不到」。
+   - 终端整体强制灰度抗锯齿作为兜底：即便个别环境回退到整行重绘，文字像素也完全一致。 */
+@keyframes termai-cursor-blink {
+  0%, 45% { opacity: 1; }
+  46%, 100% { opacity: 0; }
+}
+
+.xterm .xterm-cursor {
+  animation: termai-cursor-blink 1.2s step-end 0s infinite;
+  will-change: opacity;
+}
+
+.xterm,
+.xterm .xterm-screen,
+.xterm .xterm-rows {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

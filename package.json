@@ -1,0 +1,144 @@
+{
+  "name": "termai",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI-powered terminal & SSH client (Xshell-like)",
+  "main": "dist-electron/main/index.js",
+  "author": "TermAI",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n RENDER,ELECTRON,APP -c cyan,magenta,yellow \"npm:dev:renderer\" \"npm:dev:electron\" \"npm:dev:app\"",
+    "dev:renderer": "vite",
+    "dev:electron": "node scripts/build-electron.mjs watch",
+    "dev:app": "wait-on http-get://127.0.0.1:5173/ file:dist-electron/main/index.js -t 60000 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 node scripts/run-electron.mjs",
+    "start": "cross-env ELECTRON_DISABLE_SANDBOX=1 NODE_ENV=production electron . --user-data-dir=./.electron-userdata --no-sandbox --disable-gpu-sandbox",
+    "build": "npm run build:renderer && npm run build:electron",
+    "build:renderer": "tsc -b && vite build",
+    "build:electron": "node scripts/build-electron.mjs build",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "check": "tsc -b --noEmit",
+    "test": "node scripts/run-tests.mjs",
+    "setup:hooks": "node scripts/setup-hooks.mjs"
+  },
+  "dependencies": {
+    "@xterm/addon-canvas": "^0.7.0",
+    "@xterm/addon-search": "^0.16.0",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.511.0",
+    "node-pty": "^1.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.3.0",
+    "ssh2": "^1.15.0",
+    "tailwind-merge": "^3.0.2",
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0",
+    "zustand": "^5.0.3"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.2.0",
+    "@eslint/js": "^9.25.0",
+    "@types/node": "^22.15.30",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/ssh2": "^1.15.1",
+    "@vitejs/plugin-react": "^4.4.1",
+    "autoprefixer": "^10.4.21",
+    "babel-plugin-react-dev-locator": "^1.0.6",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^31.3.1",
+    "electron-builder": "^24.13.3",
+    "esbuild": "^0.21.5",
+    "eslint": "^9.25.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.19",
+    "globals": "^16.0.0",
+    "postcss": "^8.5.3",
+    "rcedit": "^5.0.2",
+    "tailwindcss": "^3.4.17",
+    "typescript": "~5.8.3",
+    "typescript-eslint": "^8.30.1",
+    "vite": "^6.3.5",
+    "vite-plugin-electron-renderer": "^0.14.6",
+    "vite-tsconfig-paths": "^5.1.4",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.termai.app",
+    "productName": "TermAI",
+    "directories": {
+      "output": "release/${version}"
+    },
+    "asar": true,
+    "afterPack": "scripts/afterPack.mjs",
+    "files": [
+      "dist",
+      "dist-electron",
+      "package.json",
+      "assets/icons/**",
+      "node_modules/ssh2/**",
+      "node_modules/cpu-features/**",
+      "node_modules/nan/**",
+      "node_modules/buildcheck/**",
+      "!node_modules/ssh2/test/**",
+      "!node_modules/ssh2/.github/**",
+      "!node_modules/ssh2/examples/**",
+      "!**/*.map",
+      "!node_modules/node-pty/deps/**"
+    ],
+    "asarUnpack": [
+      "node_modules/ssh2/**",
+      "node_modules/cpu-features/**",
+      "node_modules/node-pty/**"
+    ],
+    "npmRebuild": false,
+    "forceCodeSigning": false,
+    "nodeGypRebuild": false,
+    "icon": "assets/icons/icon-512.png",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icons/icon.ico",
+      "signingHashAlgorithms": []
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "TermAI",
+      "installerIcon": "assets/icons/icon.ico",
+      "uninstallerIcon": "assets/icons/icon.ico",
+      "perMachine": false,
+      "unicode": true,
+      "deleteAppDataOnUninstall": false,
+      "differentialPackage": false
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ]
+    }
+  }
+}

@@ -1,0 +1,16 @@
+#!/usr/bin/env sh
+# TermAI 提交前钩子：在 git commit 时跑 ESLint + 类型检查 + 单测，拦截明显问题。
+# 启用方式（项目根目录执行一次）： npm run setup:hooks
+# 该命令会把 git 的 hooks 目录指向本仓库的 .githooks（无需 husky / 联网）。
+set -e
+
+echo "[pre-commit] ESLint ..."
+npm run lint
+
+echo "[pre-commit] 类型检查 ..."
+npm run check
+
+echo "[pre-commit] 单元测试 ..."
+npm test
+
+echo "[pre-commit] 全部通过 ✅"
