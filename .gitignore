@@ -33,3 +33,29 @@ tmp-asar-check*/
 *.njsproj
 *.sln
 *.sw?
+
+# 打包产物 / 发布文件
+release/
+dist/
+build/
+out/
+
+# 可执行文件
+*.exe
+*.msi
+*.dmg
+*.deb
+*.AppImage
+
+# 依赖与缓存
+node_modules/
+__pycache__/
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 环境变量与密钥
+.env
+.env.local
