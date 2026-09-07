@@ -15,7 +15,9 @@ const tests = [
   "electron/main/socks5.test.ts",
   "src/store/configImport.test.ts",
   "src/lib/splitLayout.test.ts",
+  "src/lib/sanitize.test.ts",
   "src/lib/contextCompression.test.ts",
+  "electron/main/deepLink.test.ts",
 ];
 
 const bundled = [];

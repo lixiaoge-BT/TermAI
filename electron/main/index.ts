@@ -6,6 +6,8 @@ import { createSshManager } from "./ssh.js";
 import { createLocalTerminalManager } from "./localTerminal.js";
 import { createLocalFsManager } from "./localFs.js";
 import { createRecordingsManager } from "./recordings.js";
+import { parseJumpArgs, type JumpConnectParams } from "./deepLink.js";
+import { logArgvEntry, logEmptyArgvNotice } from "./argvDebug.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -21,9 +23,46 @@ if (process.platform === "win32") {
   app.commandLine.appendSwitch("disable-dev-shm-usage", "true");
 }
 
+// ---------- 自定义协议注册（堡垒机 / deep link 唤起用） ----------
+// 让 termai://connect?... 能被系统唤起到本进程。开发模式下需要显式传 argv
+// 告诉 Electron 用哪个 exe 去注册，避免 dev server 时注册到 node 上。
+if (process.defaultApp && process.argv.length >= 2) {
+  app.setAsDefaultProtocolClient("termai", process.execPath, [
+    join(__dirname, ".."), // 项目根目录，让 dev 模式也能命中
+  ]);
+} else {
+  app.setAsDefaultProtocolClient("termai");
+}
+
+/**
+ * 「待推送」外部跳转连接请求：在 did-finish-load 之前就被解析出来的请求先存这里，
+ * 渲染层 ready 后由 deliverJumpRequest 一次性推过去，避免消息丢失。
+ * @type {JumpConnectParams | null}
+ */
+let pendingJumpRequest: JumpConnectParams | null = null;
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
   process.exit(0);
+}
+
+// 本进程拿到锁（即本进程是 first instance），先试着从 process.argv 解析外部跳转参数。
+// macOS 上 URL 走 open-url 不走 argv；这里只覆盖 Windows 协议唤起 / 命令行启动场景。
+{
+  const init = parseJumpArgs(process.argv, "windows-protocol");
+  if (init) {
+    pendingJumpRequest = init;
+    console.log("[main] ✅ 首次启动 argv 解析到跳转参数:", {
+      protocol: init.protocol,
+      host: init.host,
+      port: init.port,
+      username: init.username,
+      hasPassword: !!init.password,
+    });
+  }
+  // 把「启动期 argv + 解析结果」写到本地日志，方便排查堡垒机到底传了什么格式
+  logArgvEntry(process.argv, "first-instance", init);
+  if (!init) logEmptyArgvNotice();
 }
 
 // ---------- 启动期错误兜底 ----------
@@ -80,6 +119,35 @@ async function createWindow() {
     },
   });
 
+  // ── ① 关键顺序：did-finish-load 监听必须在 loadURL/loadFile 之前注册 ──────────
+  // 原实现把 `await win.loadFile()` 放在注册之前，而 await 返回时 did-finish-load
+  // 早已触发完毕 —— 监听器永远收不到事件。后果：堡垒机「首次唤起」TermAI 时，
+  // argv 解析成功（[main] ✅ 首次启动 argv 解析到跳转参数），但参数卡在
+  // pendingJumpRequest 里推不进渲染层，表现就是「TermAI 弹出来了但只连到本地终端」。
+  win.webContents.on("did-finish-load", () => {
+    console.log("[main] ✅ 页面加载完成");
+    if (win && !win.isDestroyed() && !win.isVisible()) win.show();
+
+    // 把启动早期缓存的跳转参数送进渲染层（堡垒机首次唤起走这条路径）。
+    if (pendingJumpRequest) {
+      console.log("[main] 📡 推送缓存的跳转参数给渲染层:", {
+        protocol: pendingJumpRequest.protocol,
+        host: pendingJumpRequest.host,
+        port: pendingJumpRequest.port,
+        username: pendingJumpRequest.username,
+      });
+      win.webContents.send("jump:connect", pendingJumpRequest);
+      pendingJumpRequest = null;
+    }
+  });
+
+  // ── ② 兜底显示窗口（在 load 之前启动；放到 await 之后创建等于没有兜底）──────
+  const showTimer = setTimeout(() => {
+    if (win && !win.isDestroyed() && !win.isVisible()) win.show();
+  }, 5000);
+  win.once("closed", () => clearTimeout(showTimer));
+
+  // ── ③ 加载页面 ──────────────────────────────────────────────────────────────
   if (VITE_DEV_SERVER_URL) {
     await win.loadURL(VITE_DEV_SERVER_URL);
     // 开发期不再自动弹出 DevTools，需要时按 F12 手动打开
@@ -105,17 +173,18 @@ async function createWindow() {
   recordingsManager = createRecordingsManager();
   console.log("[main] SSH Manager 和 Local Terminal Manager 已初始化");
 
-  // 监听渲染进程加载完成
-  win.webContents.on("did-finish-load", () => {
-    console.log("[main] ✅ 页面加载完成");
-    if (win && !win.isDestroyed() && !win.isVisible()) win.show();
-  });
-
-  // 兜底：若 5 秒内仍未加载完成（如资源异常），也先把窗口显示出来，避免「黑屏/不启动」
-  const showTimer = setTimeout(() => {
-    if (win && !win.isDestroyed() && !win.isVisible()) win.show();
-  }, 5000);
-  win.once("closed", () => clearTimeout(showTimer));
+  // ── ⑤ 双保险：万一 did-finish-load 仍未触发（极端时序 / 页面瞬时完成）──────────
+  // 只要页面已就绪就直接补发，避免堡垒机的跳转参数卡死在缓存里。
+  if (pendingJumpRequest && win && !win.isDestroyed() && !win.webContents.isLoading()) {
+    console.log("[main] 📡 补发缓存的跳转参数（did-finish-load 未触发，兜底直投）:", {
+      protocol: pendingJumpRequest.protocol,
+      host: pendingJumpRequest.host,
+      port: pendingJumpRequest.port,
+      username: pendingJumpRequest.username,
+    });
+    win.webContents.send("jump:connect", pendingJumpRequest);
+    pendingJumpRequest = null;
+  }
 
   // 监听渲染进程加载失败
   win.webContents.on("did-fail-load", (_e, errorCode, errorDescription, validatedUrl) => {
@@ -188,12 +257,63 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("second-instance", () => {
+app.on("second-instance", (_event, argv) => {
+  console.log("[main] second-instance argv:", argv);
+  // 把已有窗口抢到前台（用户感知：堡垒机里再点一下 TermAI 不闪退）
   if (win) {
     if (win.isMinimized()) win.restore();
     win.focus();
   }
+  // 二次启动：堡垒机再次点击 / deep-link 重新唤起，会带新 argv 入来。
+  // 这里解析后立刻转发给渲染层（已有窗口），不走 pendingJumpRequest 缓存。
+  const req = parseJumpArgs(argv || [], "second-instance");
+  logArgvEntry(argv || [], "second-instance", req);
+  if (req) {
+    console.log("[main] 📡 second-instance → 解析到跳转参数 →", {
+      protocol: req.protocol,
+      host: req.host,
+      port: req.port,
+      username: req.username,
+    });
+    deliverJumpRequest(req);
+  }
 });
+
+// macOS 协议唤起专用：URL 走 open-url 而不是 argv
+app.on("open-url", (event, url) => {
+  console.log("[main] open-url:", url);
+  event.preventDefault?.();
+  const argv = [url];
+  const req = parseJumpArgs(argv, "open-url");
+  logArgvEntry(argv, "open-url", req);
+  if (req) {
+    console.log("[main] 📡 open-url → 解析到跳转参数 →", {
+      protocol: req.protocol,
+      host: req.host,
+      port: req.port,
+      username: req.username,
+    });
+    deliverJumpRequest(req);
+  }
+});
+
+/**
+ * 把外部跳转连接请求送到渲染层（jump:connect）。
+ * 若窗口尚未 ready，请求会暂存到 pendingJumpRequest，等 did-finish-load 再补发。
+ */
+function deliverJumpRequest(req: JumpConnectParams) {
+  if (
+    win &&
+    !win.isDestroyed() &&
+    win.webContents &&
+    !win.webContents.isLoading()
+  ) {
+    win.webContents.send("jump:connect", req);
+    return;
+  }
+  // 还没 ready 或正在 load，先缓存
+  pendingJumpRequest = req;
+}
 
 app.on("activate", () => {
   const allWindows = BrowserWindow.getAllWindows();

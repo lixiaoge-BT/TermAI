@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { HostPanel } from "@/components/HostPanel";
 import { SplitView } from "@/components/SplitView";
 import { useLayoutStore } from "@/store/layout";
-import { computeLayout, createLeaf, findLeaf, type SplitDirection } from "@/lib/splitLayout";
+import { computeLayout, createLeaf, findLeaf, listLeaves, type SplitDirection } from "@/lib/splitLayout";
 import { AISidebar } from "@/components/AISidebar";
 import { FileManager } from "@/components/FileManager";
 import { ForwardManager } from "@/components/ForwardManager";
@@ -12,7 +12,7 @@ import { useAppConfig } from "@/store/config";
 import { useChatStore, currentChatKey } from "@/store/chat";
 import { useAgentStore } from "@/store/agent";
 import { startRecording, isRecording, getElapsed, formatDuration, serializeOperations, stopAllRecordings } from "@/lib/recorder";
-import { Plus, X, LogOut, Server, Sparkles, Terminal as TermIcon, ChevronRight, Moon, Sun, Monitor, Circle, Film } from "lucide-react";
+import { Plus, X, LogOut, Server, Sparkles, Terminal as TermIcon, ChevronRight, Moon, Sun, Monitor, Circle, Film, Columns2, Rows2, Square } from "lucide-react";
 
 export default function Home() {
   const { sessions, activeSessionId, createSession, removeSession, setActiveSession } = useTerminalStore();
@@ -26,6 +26,15 @@ export default function Home() {
   const [recElapsed, setRecElapsed] = useState(0);
   // 录制总开关：开启后「跟随当前聚焦面板」录制，停止时保存所有录制中的会话
   const [recordingOn, setRecordingOn] = useState(false);
+
+  // 终端里输入 ?问题 上抛的处理。必须保持引用稳定：XTerminal 的输入订阅 effect
+  // 依赖它，身份一变就会 dispose + 重新注册 onData（原本逐块输出都会触发一次）。
+  const handleRequestAI = useCallback((p: string) => {
+    setAiOpen(true);
+    setTimeout(() => {
+      window.dispatchEvent(new CustomEvent("termai:quick-ask", { detail: p }));
+    }, 50);
+  }, []);
 
   // 确保至少有一个会话 Tab
   useEffect(() => {
@@ -41,6 +50,7 @@ export default function Home() {
   // ---- 分屏：布局树与终端会话的联动 ----
   const layoutRoot = useLayoutStore((s) => s.root);
   const focusedPaneId = useLayoutStore((s) => s.focusedPaneId);
+  const paneCount = useMemo(() => listLeaves(layoutRoot).length, [layoutRoot]);
 
   // 1) 聚焦面板变化时，把「激活会话」同步为该面板展示的会话
   //    （AI 侧栏、状态栏、快捷命令、录制等都依赖 activeSessionId）
@@ -344,6 +354,33 @@ export default function Home() {
               <Plus size={14} />
               新建
             </button>
+            {/* 分屏按钮：左右/上下分屏。从 tab 栏直接发起，
+                对当前聚焦面板分屏（SplitView 内部会回退到第一个面板）。
+                不再在每个面板标题条上重复放分屏入口 —— 见 SplitView。 */}
+            <div className="flex items-center gap-0.5 ml-1 pl-1 border-l border-border-primary h-6">
+              <button
+                onClick={() => handleSplit(focusedPaneId ?? "", "row")}
+                className="h-full px-1.5 flex items-center text-text-secondary hover:bg-bg-tertiary rounded transition-colors"
+                title="左右分屏（按当前聚焦面板）"
+              >
+                <Columns2 size={14} />
+              </button>
+              <button
+                onClick={() => handleSplit(focusedPaneId ?? "", "column")}
+                className="h-full px-1.5 flex items-center text-text-secondary hover:bg-bg-tertiary rounded transition-colors"
+                title="上下分屏（按当前聚焦面板）"
+              >
+                <Rows2 size={14} />
+              </button>
+              <button
+                onClick={() => useLayoutStore.getState().mergeToSinglePane(focusedPaneId ?? undefined)}
+                disabled={paneCount <= 1}
+                className="h-full px-1.5 flex items-center text-text-secondary hover:bg-bg-tertiary rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                title={paneCount <= 1 ? "当前只有一个面板" : "取消分屏（合并为单一面板，保留当前聚焦）"}
+              >
+                <Square size={14} />
+              </button>
+            </div>
             {active?.connected && (
               <div className="ml-auto pr-2">
                 <button
@@ -360,16 +397,7 @@ export default function Home() {
           {/* 终端区：分屏布局。所有终端常驻挂载、按面板矩形定位，
               切换/分屏都不重挂载 XTerminal，SSH 与 PTY 不会中断。 */}
           <div className="flex-1 relative min-h-0 bg-terminal-bg flex flex-col">
-            <SplitView
-              onRequestAI={(p) => {
-                if (!aiOpen) setAiOpen(true);
-                setTimeout(() => {
-                  const ev = new CustomEvent("termai:quick-ask", { detail: p });
-                  window.dispatchEvent(ev);
-                }, 50);
-              }}
-              onSplit={handleSplit}
-            />
+            <SplitView onRequestAI={handleRequestAI} />
           </div>
         </div>
 

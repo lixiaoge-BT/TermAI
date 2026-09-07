@@ -11,6 +11,7 @@ import {
   findLeaf,
   findLeafBySession,
   computeLayout,
+  collapseToLeaf,
   type SplitNode,
 } from "./splitLayout";
 
@@ -83,6 +84,43 @@ describe("closePane", () => {
       listLeaves(out!).map((l) => l.sessionId),
       ["s1", "s2"]
     );
+  });
+});
+
+describe("collapseToLeaf", () => {
+  test("把兄弟面板丢掉，只留目标 leaf 作为新根（保留其 sessionId）", () => {
+    const a = createLeaf("s1");
+    const b = createLeaf("s2");
+    const root = splitPane(a, a.id, "row", b);
+    const out = collapseToLeaf(root, a.id);
+    assert.ok(out);
+    assert.strictEqual(out?.type, "leaf");
+    assert.strictEqual(out?.id, a.id);
+    assert.strictEqual(out?.sessionId, "s1");
+  });
+
+  test("命中深层 leaf：兄弟/祖先 split 全部消失", () => {
+    const a = createLeaf("s1");
+    const b = createLeaf("s2");
+    const c = createLeaf("s3");
+    const root = splitPane(splitPane(a, a.id, "row", b), b.id, "column", c);
+    const out = collapseToLeaf(root, c.id);
+    assert.ok(out);
+    assert.strictEqual(out?.id, c.id);
+    assert.strictEqual(out?.sessionId, "s3");
+    assert.strictEqual(out?.type, "leaf");
+  });
+
+  test("未命中 → 返回 null（让上层决定是否拒绝）", () => {
+    const a = createLeaf("s1");
+    const b = createLeaf("s2");
+    const root = splitPane(a, a.id, "row", b);
+    assert.strictEqual(collapseToLeaf(root, "nope"), null);
+  });
+
+  test("唯一叶子 → 返回同一引用（便于上层用 === 判等）", () => {
+    const a = createLeaf("s1");
+    assert.strictEqual(collapseToLeaf(a, a.id), a);
   });
 });
 

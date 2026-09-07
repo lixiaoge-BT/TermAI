@@ -131,6 +131,11 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
   const lastAutoAnalyzeRef = useRef(0);
   useEffect(() => { aiConfigRef.current = aiConfig; }, [aiConfig]);
 
+  // onRequestAI 走 ref：Home 每次重渲染都会换掉这个内联回调的身份，
+  // 若把它放进输入订阅 effect 的依赖，onData 会被反复 dispose + 重注册。
+  const onRequestAIRef = useRef(onRequestAI);
+  useEffect(() => { onRequestAIRef.current = onRequestAI; }, [onRequestAI]);
+
   // 命中报错关键词且开启自动分析时，唤起 AI 分析（带 20s 防抖，避免输出风暴）
   const tryAutoAnalyze = (text: string) => {
     const cfg = aiConfigRef.current;
@@ -458,6 +463,24 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
 
   // 2. 监听 SSH / 本地终端事件
   useEffect(() => {
+    // 本 effect 内所有延时回调统一登记，卸载时一次性清掉。
+    // 之前这里是裸 setTimeout：面板关闭后定时器仍会对已 dispose 的 xterm 实例
+    // 调 focus()，在控制台刷异常。cancelled 用于兜底（清理后仍被触发的情况）。
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    let cancelled = false;
+    const later = (fn: () => void, ms: number) => {
+      const id = setTimeout(() => {
+        timers.delete(id);
+        if (!cancelled) fn();
+      }, ms);
+      timers.add(id);
+    };
+    const clearTimers = () => {
+      cancelled = true;
+      timers.forEach((id) => clearTimeout(id));
+      timers.clear();
+    };
+
     if (mode === "local") {
       if (!window.localTerminal) return;
 
@@ -481,7 +504,7 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
         // PTY 真正就绪的这一刻才能把尺寸推成功，之前的调用全是空转
         pushSizeRef.current?.();
         termRef.current?.writeln("\x1b[1;32m✅ 本地终端已就绪\x1b[0m");
-        setTimeout(() => {
+        later(() => {
           const t = termRef.current;
           if (t) { assertBlinking(t); t.focus(); }
           pushSizeRef.current?.();
@@ -502,6 +525,7 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
       });
 
       return () => {
+        clearTimers();
         unsubData?.();
         unsubReady?.();
         unsubExit?.();
@@ -535,7 +559,7 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
           // 远端 shell 刚建好，此刻把真实尺寸推过去（建立 shell 时若未带上，
           // 这里就是唯一的补救机会，否则 PTY 会一直停在 80x24）
           pushSizeRef.current?.();
-          setTimeout(() => {
+          later(() => {
             if (term) { assertBlinking(term); term.focus(); }
             pushSizeRef.current?.();
           }, 150);
@@ -565,7 +589,7 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
           term?.writeln("");
           term?.writeln("\x1b[1;32m✅ 已自动重连\x1b[0m");
           pushSizeRef.current?.();
-          setTimeout(() => {
+          later(() => {
             if (term) { assertBlinking(term); term.focus(); }
             pushSizeRef.current?.();
           }, 150);
@@ -584,6 +608,7 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
     });
 
     return () => {
+      clearTimers();
       unsubscribe?.();
       unsubscribeStatus?.();
     };
@@ -632,8 +657,8 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
           const line = currentLineRef.current.trim();
           if (line) {
             pushHistory(line);
-            if (onRequestAI && line.startsWith("?")) {
-              onRequestAI(line.slice(1).trim());
+            if (onRequestAIRef.current && line.startsWith("?")) {
+              onRequestAIRef.current(line.slice(1).trim());
             } else {
               term.writeln("\x1b[33m[未连接 SSH] 输入 ?<问题> 可直接问 AI。\x1b[0m");
             }
@@ -708,7 +733,7 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
     };
 
     return () => disposable.dispose();
-  }, [sessionId, session?.status, appendCommand, onRequestAI, mode]);
+  }, [sessionId, session?.status, appendCommand, mode]);
 
   return (
     <div

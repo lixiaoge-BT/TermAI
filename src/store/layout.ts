@@ -8,6 +8,7 @@ import {
   mapLeaves,
   listLeaves,
   findLeaf,
+  collapseToLeaf,
   type SplitNode,
   type SplitDirection,
   type SplitLeaf,
@@ -20,6 +21,11 @@ interface LayoutState {
   focusPane: (paneId: string) => void;
   /** 在 paneId 处切一刀，newLeaf 成为新面板 */
   splitWith: (paneId: string, direction: SplitDirection, newLeaf: SplitLeaf) => void;
+  /**
+   * 取消分屏：把所有面板合并为一个，保留传入/聚焦/第一个面板作为唯一叶子。
+   * 仅一个面板时 no-op。
+   */
+  mergeToSinglePane: (paneId?: string) => void;
   /** 关闭面板（最后一个面板不允许关闭） */
   closePaneById: (paneId: string) => void;
   setPaneSessionById: (paneId: string, sessionId: string | null) => void;
@@ -59,6 +65,26 @@ export const useLayoutStore = create<LayoutState>((set, get) => ({
     if (next === get().root) return;
     // 新面板成为焦点，方便立即操作
     set(withValidFocus(next, newLeaf.id));
+  },
+
+  /**
+   * 取消分屏：把所有面板合并成一个面板，留下的就是当前聚焦的那个。
+   * - 仅一个面板时直接 no-op（没有可收的）
+   * - 未传 paneId 时回退到第一个面板
+   * - 其它面板的会话不会从 terminalStore 删除，只是不再展示；
+   *   通过重新分屏或点击对应 tab（ensureVisible）可以再次显示。
+   */
+  mergeToSinglePane: (paneId) => {
+    const root = get().root;
+    if (listLeaves(root).length <= 1) return;
+    const target =
+      paneId && findLeaf(root, paneId)
+        ? paneId
+        : (findLeaf(root, get().focusedPaneId ?? "")?.id ?? listLeaves(root)[0]?.id);
+    if (!target) return;
+    const leaf = collapseToLeaf(root, target);
+    if (!leaf) return;
+    set(withValidFocus(leaf, leaf.id));
   },
 
   closePaneById: (paneId) => {

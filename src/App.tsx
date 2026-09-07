@@ -3,9 +3,13 @@ import { useEffect } from "react";
 import Home from "@/pages/Home";
 import { useAppConfig } from "@/store/config";
 import { initTerminalBridge } from "@/lib/terminalBridge";
+import { initJumpConnect } from "@/lib/jumpConnect";
 
 // 应用启动时注册一次全局终端桥（AI 命令下发 / 快捷连接），保证多标签命令路由正确
 initTerminalBridge();
+// 应用启动时挂上「外部唤起」监听（堡垒机 / termai:// 协议唤起时自动建 SSH tab）
+// 必须在 initTerminalBridge 之后：jump 内部要复用 __termai_connect。
+initJumpConnect();
 
 export default function App() {
   const theme = useAppConfig((s) => s.theme);

@@ -85,6 +85,27 @@ export type SshForwardStatus = {
   error?: string;
 };
 
+/**
+ * 外部唤起（堡垒机 / 自定义协议 / 命令行参数）的连接参数。
+ * 主进程解析后通过 jump:connect 事件推送到渲染层，渲染层自动建标签 + 连 SSH。
+ */
+export type JumpSource =
+  | "argv"               // 首次启动从 process.argv 解析
+  | "second-instance"    // 二次启动，second-instance 事件拿到第二个 argv
+  | "open-url"           // macOS 协议唤起，open-url 事件
+  | "windows-protocol";  // Windows 协议唤起（argv 里带协议头）
+
+export type JumpConnectParams = {
+  protocol: "ssh";
+  host: string;
+  port: number;
+  username: string;
+  password?: string;
+  privateKey?: string;
+  /** 来源标识，便于排查 */
+  source: JumpSource;
+};
+
 const sshApi = {
   connect: (sessionId: string, params: SshConnectParams) =>
     ipcRenderer.invoke("ssh:connect", params, sessionId) as Promise<boolean>,
@@ -274,6 +295,22 @@ contextBridge.exposeInMainWorld("__termai_debug", {
   ping: () => ipcRenderer.invoke("ping", "hello from renderer"),
 });
 
+/**
+ * 外部唤起 Jump Connect —— 配合主进程 deepLink.ts / 堡垒机对接。
+ * 主进程解析出 host/user/port/password 后通过 jump:connect 消息推到这里，
+ * 渲染层的 src/lib/jumpConnect.ts 监听后自动建 SSH tab 并连接。
+ */
+const jumpApi = {
+  onJumpConnect: (callback: (params: JumpConnectParams) => void) => {
+    const listener = (_e: unknown, params: JumpConnectParams) => callback(params);
+    ipcRenderer.on("jump:connect", listener);
+    return () => {
+      ipcRenderer.off("jump:connect", listener);
+    };
+  },
+};
+contextBridge.exposeInMainWorld("__jump", jumpApi);
+
 export type SshApi = typeof sshApi;
 export type WinApi = typeof winApi;
 export type LocalTerminalApi = typeof localTerminalApi;
@@ -281,3 +318,4 @@ export type SftpApi = typeof sftpApi;
 export type LocalFsApi = typeof localFsApi;
 export type SecureStorageApi = typeof secureStorageApi;
 export type RecordingsApi = typeof recordingsApi;
+export type JumpApi = typeof jumpApi;

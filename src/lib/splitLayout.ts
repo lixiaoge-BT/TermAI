@@ -147,6 +147,22 @@ export function mapLeaves(
   return na === a && nb === b ? root : { ...root, children: [na, nb] };
 }
 
+/**
+ * 把整棵树「收」成只剩目标叶子：找到 paneId 所在的那个 leaf，
+ * 把它直接作为新根返回；其他分支/兄弟节点全部丢弃。
+ *
+ * 用途：「取消分屏」——把所有面板合并回一个面板，留下的就是被聚焦的那一个。
+ * - 未命中返回 null（调用方应阻止）
+ * - 命中但 paneId 本身就是唯一叶子时，返回的就是它本身（同一引用，便于上层判等）
+ */
+export function collapseToLeaf(root: SplitNode, paneId: string): SplitLeaf | null {
+  if (root.type === "leaf") return root.id === paneId ? root : null;
+  const [a, b] = root.children;
+  const fromA = collapseToLeaf(a, paneId);
+  if (fromA) return fromA;
+  return collapseToLeaf(b, paneId);
+}
+
 export function listLeaves(root: SplitNode): SplitLeaf[] {
   if (root.type === "leaf") return [root];
   return [...listLeaves(root.children[0]), ...listLeaves(root.children[1])];

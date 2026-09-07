@@ -1,6 +1,27 @@
 /// <reference types="vite/client" />
 
-import type { SshApi, WinApi, LocalTerminalApi, SshConnectParams, SshProxyJumpConfig, SshSessionInfo, SftpApi, LocalFsApi, SecureStorageApi, RecordingsApi, RecordingMeta, RemoteFileInfo, LocalFileInfo, SftpProgress, SshForwardType, SshForwardSpec, SshForwardStatus } from "../../electron/preload";
+import type {
+  SshApi,
+  WinApi,
+  LocalTerminalApi,
+  SshConnectParams,
+  SshProxyJumpConfig,
+  SshSessionInfo,
+  SftpApi,
+  LocalFsApi,
+  SecureStorageApi,
+  RecordingsApi,
+  RecordingMeta,
+  RemoteFileInfo,
+  LocalFileInfo,
+  SftpProgress,
+  SshForwardType,
+  SshForwardSpec,
+  SshForwardStatus,
+  JumpConnectParams,
+  JumpSource,
+  JumpApi,
+} from "../../electron/preload";
 
 declare global {
   interface Window {
@@ -13,10 +34,25 @@ declare global {
     secureStorage: SecureStorageApi;
     recordings: RecordingsApi;
     __termai_debug?: { ping: () => Promise<string> };
+    /** 外部唤起（堡垒机 / termai:// 协议）入口 contextBridge */
+    __jump?: JumpApi;
   }
 }
 
-export type { SshConnectParams, SshProxyJumpConfig, SshSessionInfo, RemoteFileInfo, LocalFileInfo, SftpProgress, SshForwardType, SshForwardSpec, SshForwardStatus, RecordingMeta };
+export type {
+  SshConnectParams,
+  SshProxyJumpConfig,
+  SshSessionInfo,
+  RemoteFileInfo,
+  LocalFileInfo,
+  SftpProgress,
+  SshForwardType,
+  SshForwardSpec,
+  SshForwardStatus,
+  RecordingMeta,
+  JumpConnectParams,
+  JumpSource,
+};
 
 // 持久化在 HostConfig 上的转发配置（enabled 控制连接后是否自动恢复）
 export interface SshForwardConfig {

@@ -4,16 +4,11 @@ import { useLayoutStore } from "@/store/layout";
 import { useTerminalStore } from "@/store/terminal";
 import { useAppConfig } from "@/store/config";
 import { computeLayout, type Rect, type SplitDirection } from "@/lib/splitLayout";
-import { Columns2, Rows2, X as XIcon, LayoutGrid, Server, Plus } from "lucide-react";
-
-// 每个面板顶部标题条的高度（px）。终端区域 = 面板矩形减去这个高度。
-const HEADER_H = 28;
+import { LayoutGrid, Server, Plus } from "lucide-react";
 
 interface Props {
   /** 终端里输入 ?问题 时上抛给 Home 处理 */
   onRequestAI: (prompt: string) => void;
-  /** 请求分屏：由 Home 决定新面板放哪个会话 */
-  onSplit: (paneId: string, direction: SplitDirection) => void;
 }
 
 /**
@@ -24,19 +19,18 @@ interface Props {
  * display:none。这样切分屏 / 换会话都不会重挂载 XTerminal，
  * SSH 连接与 PTY 不会中断（卸载再挂载会重建终端、丢回显）。
  * 面板尺寸变化由 XTerminal 内部的 ResizeObserver 自动 fit + 同步 PTY。
+ *
+ * 2026-09-04 调整：去掉每个面板顶部的「面板标题条」（select / 分屏按钮 / 关闭），
+ * 分屏入口已上移到 tab 栏，避免每面板重复出现分屏图标。
  */
-export function SplitView({ onRequestAI, onSplit }: Props) {
+export function SplitView({ onRequestAI }: Props) {
   const sessions = useTerminalStore((s) => s.sessions);
   const getHost = useAppConfig((c) => c.getHost);
   const hostConfigs = useAppConfig((c) => c.hosts);
   const setHostFormOpen = useAppConfig((c) => c.setHostFormOpen);
 
   const root = useLayoutStore((s) => s.root);
-  const focusedPaneId = useLayoutStore((s) => s.focusedPaneId);
   const focusPane = useLayoutStore((s) => s.focusPane);
-  const closePaneById = useLayoutStore((s) => s.closePaneById);
-  const setPaneSessionById = useLayoutStore((s) => s.setPaneSessionById);
-  const setSplitRatio = useLayoutStore((s) => s.setSplitRatio);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [drag, setDrag] = useState<{
@@ -56,8 +50,6 @@ export function SplitView({ onRequestAI, onSplit }: Props) {
     return m;
   }, [layout]);
 
-  const onlyOnePane = layout.leaves.length <= 1;
-
   // 拖拽分隔条调整比例
   useEffect(() => {
     if (!drag) return;
@@ -73,7 +65,7 @@ export function SplitView({ onRequestAI, onSplit }: Props) {
         const py = (e.clientY - box.top) / box.height;
         ratio = (py - drag.parent.y) / drag.parent.h;
       }
-      setSplitRatio(drag.splitId, ratio);
+      useLayoutStore.getState().setSplitRatio(drag.splitId, ratio);
     };
     const onUp = () => setDrag(null);
     window.addEventListener("mousemove", onMove);
@@ -82,24 +74,15 @@ export function SplitView({ onRequestAI, onSplit }: Props) {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [drag, setSplitRatio]);
-
-  /** 给面板指派会话；若该会话已在别的面板展示则两者互换 */
-  const assignSession = (paneId: string, sessionId: string) => {
-    const holder = layout.leaves.find(
-      (l) => l.sessionId === sessionId && l.paneId !== paneId
-    );
-    const current = layout.leaves.find((l) => l.paneId === paneId)?.sessionId ?? null;
-    setPaneSessionById(paneId, sessionId);
-    if (holder) setPaneSessionById(holder.paneId, current);
-  };
+  }, [drag]);
 
   return (
     <div
       ref={containerRef}
       className={`relative flex-1 min-h-0 bg-terminal-bg ${drag ? "select-none" : ""}`}
     >
-      {/* 1) 终端实例层：全部常驻挂载，按面板矩形定位 */}
+      {/* 1) 终端实例层：全部常驻挂载，按面板矩形定位。
+          面板内不再有标题条，分屏入口已上移到 tab 栏。 */}
       {sessions.map((s) => {
         const cell = cellBySession.get(s.id);
         const hostConfig = s.hostId ? getHost(s.hostId) ?? null : null;
@@ -111,9 +94,9 @@ export function SplitView({ onRequestAI, onSplit }: Props) {
               cell
                 ? {
                     left: `${cell.rect.x * 100}%`,
-                    top: `calc(${cell.rect.y * 100}% + ${HEADER_H}px)`,
+                    top: `${cell.rect.y * 100}%`,
                     width: `${cell.rect.w * 100}%`,
-                    height: `calc(${cell.rect.h * 100}% - ${HEADER_H}px)`,
+                    height: `${cell.rect.h * 100}%`,
                     display: "block",
                   }
                 : { display: "none" }
@@ -148,9 +131,9 @@ export function SplitView({ onRequestAI, onSplit }: Props) {
             className="absolute inset-0 flex items-center justify-center bg-terminal-bg"
             style={{
               left: `${leaf.rect.x * 100}%`,
-              top: `calc(${leaf.rect.y * 100}% + ${HEADER_H}px)`,
+              top: `${leaf.rect.y * 100}%`,
               width: `${leaf.rect.w * 100}%`,
-              height: `calc(${leaf.rect.h * 100}% - ${HEADER_H}px)`,
+              height: `${leaf.rect.h * 100}%`,
               zIndex: 4,
             }}
           >
@@ -163,96 +146,7 @@ export function SplitView({ onRequestAI, onSplit }: Props) {
         );
       })}
 
-      {/* 2) 面板标题条 */}
-      {layout.leaves.map((leaf) => {
-        const isFocused = leaf.paneId === focusedPaneId;
-        const session = leaf.sessionId
-          ? sessions.find((s) => s.id === leaf.sessionId)
-          : undefined;
-        return (
-          <div
-            key={leaf.paneId}
-            onMouseDown={() => focusPane(leaf.paneId)}
-            className={`absolute flex items-center gap-1.5 px-2 border-b border-border-primary transition-all opacity-0 hover:opacity-100 ${
-              isFocused ? "bg-bg-active" : "bg-bg-secondary"
-            }`}
-            style={{
-              left: `${leaf.rect.x * 100}%`,
-              top: `${leaf.rect.y * 100}%`,
-              width: `${leaf.rect.w * 100}%`,
-              height: HEADER_H,
-              boxShadow: isFocused ? "inset 0 -2px 0 var(--accent)" : undefined,
-              zIndex: 3,
-            }}
-          >
-            <span
-              className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                session?.status === "connected"
-                  ? "bg-success-text"
-                  : session?.status === "connecting"
-                  ? "bg-warning-text animate-pulse"
-                  : session?.status === "error"
-                  ? "bg-danger-text"
-                  : "bg-text-tertiary"
-              }`}
-            />
-            {/* 切换该面板展示的会话 */}
-            <select
-              value={leaf.sessionId ?? ""}
-              onChange={(e) => {
-                if (e.target.value) assignSession(leaf.paneId, e.target.value);
-              }}
-              className="min-w-0 flex-1 bg-transparent outline-none text-[11px] truncate cursor-pointer text-text-primary"
-              title="选择本面板显示的会话"
-            >
-              <option value="" disabled>
-                （未选择会话）
-              </option>
-              {sessions.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.hostName}
-                </option>
-              ))}
-            </select>
-
-            <div className="flex items-center gap-0.5 flex-shrink-0">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onSplit(leaf.paneId, "row");
-                }}
-                className="p-1 rounded hover:bg-bg-hover text-text-secondary hover:text-text-link"
-                title="左右分屏"
-              >
-                <Columns2 size={12} />
-              </button>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onSplit(leaf.paneId, "column");
-                }}
-                className="p-1 rounded hover:bg-bg-hover text-text-secondary hover:text-text-link"
-                title="上下分屏"
-              >
-                <Rows2 size={12} />
-              </button>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  closePaneById(leaf.paneId);
-                }}
-                disabled={onlyOnePane}
-                className="p-1 rounded hover:bg-bg-hover text-text-secondary hover:text-danger-text disabled:opacity-30 disabled:cursor-not-allowed"
-                title={onlyOnePane ? "至少保留一个面板" : "关闭面板"}
-              >
-                <XIcon size={12} />
-              </button>
-            </div>
-          </div>
-        );
-      })}
-
-      {/* 2.5) 多面板时给每个面板加淡色边框，强化边界感但不过分突兀 */}
+      {/* 2) 多面板时给每个面板加淡色边框，强化边界感但不过分突兀 */}
       {layout.leaves.length > 1 &&
         layout.leaves.map((leaf) => (
           <div
@@ -282,18 +176,16 @@ export function SplitView({ onRequestAI, onSplit }: Props) {
           style={
             d.direction === "row"
               ? {
-                  left: `${(d.parent.x + d.at * d.parent.w) * 100}%`,
+                  left: `calc(${(d.parent.x + d.at * d.parent.w) * 100}% - 5px)`,
                   top: `${d.parent.y * 100}%`,
                   height: `${d.parent.h * 100}%`,
                   width: 10,
-                  transform: "translateX(-50%)",
                 }
               : {
-                  top: `${(d.parent.y + d.at * d.parent.h) * 100}%`,
+                  top: `calc(${(d.parent.y + d.at * d.parent.h) * 100}% - 5px)`,
                   left: `${d.parent.x * 100}%`,
                   width: `${d.parent.w * 100}%`,
                   height: 10,
-                  transform: "translateY(-50%)",
                 }
           }
           title="拖拽调整分屏比例"

@@ -352,6 +352,15 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 // =============================================
 // 聊天区
 // =============================================
+/**
+ * loading 卡死守卫时长。
+ *
+ * 只要 isLoading 为 true，发送按钮就是 disabled 的（disabled={isLoading || ...}）。
+ * 一旦 loading 因任何原因没能复位，用户就会遇到「问题输入了、点发送却毫无反应」——
+ * 且没有任何自救入口。这里给一个比 AI 请求总超时（120s）多 30s 余量的守卫兜底。
+ */
+const LOADING_STUCK_GUARD_MS = 150_000;
+
 function ChatArea({
   session,
   hostConfig,
@@ -390,6 +399,27 @@ function ChatArea({
     setInput("");
   }, [chatKey]);
 
+  // 切换会话 / 组件卸载时，中止上一个会话仍在进行的请求。
+  // ChatArea 没有 key，切换会话时组件不重建，abortRef 会一直指向旧 controller：
+  // 在新会话点「停止」会停错会话，旧会话的 loading 也可能残留成永久 disabled。
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
+    };
+  }, [chatKey]);
+
+  // 兜底：loading 若卡死（请求既没成功也没抛错），强制复位并给出提示，
+  // 否则发送按钮会永久 disabled，用户只能重启应用。
+  useEffect(() => {
+    if (!isLoading) return;
+    const guard = setTimeout(() => {
+      setLoading(false);
+      setError("请求长时间未响应，已自动恢复，请重试。");
+    }, LOADING_STUCK_GUARD_MS);
+    return () => clearTimeout(guard);
+  }, [isLoading, setLoading, setError]);
+
   // 每个会话首次打开时各生成一次欢迎语（用 Set 记录，切换会话不会互相影响）
   const welcomedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -422,6 +452,10 @@ function ChatArea({
 
     addMessage({ role: "user", content });
     setInput("");
+
+    // 若上一个请求仍在进行（例如通过快捷提示绕过 disabled 的发送按钮触发），
+    // 先中止它，避免两个请求并发写同一会话的消息、并互相覆盖 loading 状态。
+    abortRef.current?.abort();
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -461,8 +495,13 @@ function ChatArea({
         );
       }
     } finally {
-      setLoading(false);
-      abortRef.current = null;
+      // 只有自己仍是「当前请求」时才复位 loading 与 abortRef。
+      // 无条件复位的话，先发起的请求结束后会把后发起的请求错误地标记为已完成
+      // （loading 被提前清掉 → 按钮提前可用 → 更容易并发）。
+      if (abortRef.current === controller) {
+        setLoading(false);
+        abortRef.current = null;
+      }
     }
   };
 
@@ -794,8 +833,10 @@ function escapeHtml(s: string): string {
     .replace(/(^|\n) - /g, "$1• ");
 }
 
+// 不变量：linkify 的输入必须是 escapeHtml 的输出。字符类显式排除引号，
+// 这样即使将来有人调换调用顺序，也无法用引号闭合 href 来注入属性（如 onmouseover）。
 function linkify(s: string): string {
-  return s.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noreferrer" class="text-text-link underline underline-offset-2">$1</a>');
+  return s.replace(/(https?:\/\/[^\s<"']+)/g, '<a href="$1" target="_blank" rel="noreferrer" class="text-text-link underline underline-offset-2">$1</a>');
 }
 
 function WELCOME_TEMPLATE({

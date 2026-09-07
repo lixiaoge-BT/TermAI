@@ -41,8 +41,10 @@ function renderInline(text: string): string {
       );
 
       // 链接
+      // 注意不变量：本函数只能吃 escapeHtml 之后的串。字符类里显式排除引号，
+      // 保证即使将来有人漏掉/挪动 escapeHtml，也无法用引号闭合 href 注入属性。
       h = h.replace(
-        /(https?:\/\/[^\s<)]+)/g,
+        /(https?:\/\/[^\s<)"']+)/g,
         '<a href="$1" target="_blank" rel="noreferrer" class="text-text-link underline underline-offset-2">$1</a>'
       );
 

@@ -115,7 +115,15 @@
         }
       ],
       "icon": "assets/icons/icon.ico",
-      "signingHashAlgorithms": []
+      "signingHashAlgorithms": [],
+      "protocols": [
+        {
+          "name": "TermAI",
+          "schemes": [
+            "termai"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,

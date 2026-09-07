@@ -117,3 +117,96 @@ test("HTTP 非 200 抛出可读错误", async () => {
     globalThis.fetch = saved;
   }
 });
+// ---------------------------------------------------------------------------
+// 超时保护：真实故障是「AI 多问几轮 / 让改点东西就永久转圈不回复」。
+// 根因是请求挂起时没有任何超时能救 —— 这里用注入的短超时验证两条防线。
+// ---------------------------------------------------------------------------
+
+/** 构造一个永不 resolve 的 promise，模拟「连接已建立但服务端不响应」 */
+const never = () => new Promise<never>(() => {});
+
+test("流式已建立但服务端不推数据 → 空闲超时抛错（不再永久挂起）", async () => {
+  const saved = globalThis.fetch;
+  globalThis.fetch = (async () => ({
+    ok: true,
+    body: {
+      getReader: () => ({
+        read: never,
+        releaseLock: () => {},
+      }),
+    },
+  })) as unknown as typeof fetch;
+  try {
+    await assert.rejects(
+      () =>
+        chatCompletionRaw({
+          config: baseConfig,
+          messages: [{ role: "user", content: "hi" }],
+          onToken: () => {},
+          timeouts: { idleMs: 30, totalMs: 5_000 },
+        }),
+      /没有收到新数据/
+    );
+  } finally {
+    globalThis.fetch = saved;
+  }
+});
+
+test("fetch 永不返回 → 总超时抛错", async () => {
+  const saved = globalThis.fetch;
+  // 注意：mock 必须像真实 fetch 那样响应 signal，否则 abort 后 promise 永远 pending，
+  // 反而会把测试拖成 "Promise resolution is still pending"。
+  globalThis.fetch = ((_url: string, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      const s = init?.signal;
+      if (!s) return;
+      if (s.aborted) reject(s.reason);
+      else s.addEventListener("abort", () => reject(s.reason), { once: true });
+    })) as unknown as typeof fetch;
+  try {
+    await assert.rejects(
+      () =>
+        chatCompletionRaw({
+          config: baseConfig,
+          messages: [{ role: "user", content: "hi" }],
+          timeouts: { totalMs: 30 },
+        }),
+      /请求超时/
+    );
+  } finally {
+    globalThis.fetch = saved;
+  }
+});
+
+test("正常流式响应不受超时逻辑影响（回归保护）", async () => {
+  const sse = [
+    'data: {"choices":[{"delta":{"content":"a"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"b"}}]}\n\n',
+    "data: [DONE]\n\n",
+  ];
+  let i = 0;
+  const saved = globalThis.fetch;
+  globalThis.fetch = (async () => ({
+    ok: true,
+    body: {
+      getReader: () => ({
+        read: () =>
+          i < sse.length
+            ? Promise.resolve({ value: new TextEncoder().encode(sse[i++]), done: false })
+            : Promise.resolve({ value: undefined, done: true }),
+        releaseLock: () => {},
+      }),
+    },
+  })) as unknown as typeof fetch;
+  try {
+    const full = await chatCompletionRaw({
+      config: baseConfig,
+      messages: [{ role: "user", content: "hi" }],
+      onToken: () => {},
+      timeouts: { idleMs: 30, totalMs: 5_000 },
+    });
+    assert.equal(full, "ab", "短超时不应影响正常响应");
+  } finally {
+    globalThis.fetch = saved;
+  }
+});

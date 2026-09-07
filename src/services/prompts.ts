@@ -225,6 +225,34 @@ export function buildAgentSystemPrompt(ctx: {
 // =====================================================
 // 上下文注入模板
 // =====================================================
+/**
+ * 终端输出字符预算。
+ *
+ * recentOutput 的「行数」有上限（store 里 100 行），但**单行长度没有** ——
+ * cat 一个大文件、编译日志刷屏、tail 一阵服务日志，80 行能轻松堆到几十万字符，
+ * 请求体直接把上下文撑爆，表现为请求超时或服务端直接拒绝（用户感知：AI 不回复）。
+ * 这里按字符预算从「最近」往回取，保证 prompt 体积可控。
+ */
+const RECENT_OUTPUT_CHAR_BUDGET = 12_000;
+
+/** 从末尾往前累加，直到用满预算；返回裁剪后的文本与被省略的行数 */
+function clipRecentOutput(lines: string[]): { text: string; omitted: number } {
+  const picked: string[] = [];
+  let used = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i] ?? "";
+    // 单行本身超长时保留尾部（关键报错通常在最后）
+    const piece = line.length > RECENT_OUTPUT_CHAR_BUDGET
+      ? "…" + line.slice(-RECENT_OUTPUT_CHAR_BUDGET)
+      : line;
+    if (used + piece.length > RECENT_OUTPUT_CHAR_BUDGET) break;
+    used += piece.length + 1;
+    picked.push(piece);
+  }
+  picked.reverse();
+  return { text: picked.join("\n"), omitted: lines.length - picked.length };
+}
+
 export function buildContextBlock(ctx: {
   hostIp?: string;
   hostname?: string;
@@ -244,7 +272,18 @@ export function buildContextBlock(ctx: {
   if (ctx.cwd) lines.push(`- 当前目录：${ctx.cwd}`);
   if (ctx.hostTags?.length) lines.push(`- 主机标签：${ctx.hostTags.join(", ")}`);
   if (ctx.recentOutput?.length) {
-    lines.push("", "## 最近终端输出（自动捕获的实时内容，可直接分析）", "```", ctx.recentOutput.slice(-80).join("\n"), "```");
+    const clipped = clipRecentOutput(ctx.recentOutput.slice(-80));
+    const note =
+      clipped.omitted > 0
+        ? `\n…（已省略更早的 ${clipped.omitted} 行输出，避免上下文过大）`
+        : "";
+    lines.push(
+      "",
+      "## 最近终端输出（自动捕获的实时内容，可直接分析）",
+      "```",
+      clipped.text + note,
+      "```"
+    );
     lines.push("", "💡 以上是用户终端的实时输出，你可以直接分析其中的错误、警告、服务状态等，无需用户粘贴。");
   }
   if (ctx.commandHistory?.length) {
