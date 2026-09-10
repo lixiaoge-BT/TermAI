@@ -26,7 +26,6 @@ import {
 } from "lucide-react";
 import type { RiskLevel } from "@/services/safety";
 import { useSessionAgent, type AgentStep } from "@/store/agent";
-import { useTerminalStore } from "@/store/terminal";
 import { useAppConfig } from "@/store/config";
 import { renderMarkdownToHtml } from "@/lib/markdown";
 
@@ -59,12 +58,26 @@ const QUICK_TASKS = [
   { icon: ClipboardList, label: "系统信息总览", goal: "收集并汇总这台主机的系统信息：发行版、内核、CPU、内存、磁盘、运行时长" },
 ];
 
+/**
+ * Agent 面板需要的会话信息（只含标量字段）。
+ * 刻意不传整个 session 对象：终端每来一块输出都会生成新的 session 对象，
+ * 传整棵会让面板（含全部步骤卡片）跟着每一块输出重渲染。
+ */
+export interface AgentSessionLite {
+  id: string | null;
+  hostId?: string | null;
+  username?: string;
+  host?: string;
+  hostName?: string;
+  connected?: boolean;
+}
+
 export function AgentPanel({
   session,
   hostConfig: _hostConfig,
   isProduction,
 }: {
-  session: ReturnType<typeof useTerminalStore.getState>["sessions"][number] | null;
+  session: AgentSessionLite | null;
   hostConfig: ReturnType<typeof useAppConfig.getState>["hosts"][number] | null;
   isProduction?: boolean;
 }) {
@@ -78,6 +91,7 @@ export function AgentPanel({
     autoRunMedium,
     pendingConfirm,
     liveThought,
+    plan,
     setGoal,
     setAutoRunMedium,
     run,
@@ -138,6 +152,9 @@ export function AgentPanel({
             </div>
           </div>
         )}
+
+        {/* 执行计划蓝图：AI 接管初期输出的 <<<PLAN>>>，作为进度参照展示 */}
+        {plan && <PlanCard plan={plan} />}
 
         {steps.map((step) => (
           <StepCard key={step.id} step={step} />
@@ -483,6 +500,23 @@ function ConfirmCard({
           确认执行
         </button>
       </div>
+    </div>
+  );
+}
+
+function PlanCard({ plan }: { plan: string }) {
+  const html = useMemo(() => renderMarkdownToHtml(plan), [plan]);
+  return (
+    <div className="rounded-lg border border-accent/40 bg-bg-tertiary overflow-hidden">
+      <div className="flex items-center gap-1.5 px-3 py-2 border-b border-border-primary">
+        <ClipboardList size={13} className="text-text-link" />
+        <span className="text-xs font-semibold text-text-primary">执行计划</span>
+        <span className="ml-auto text-[10px] text-text-tertiary">AI 将按计划逐步执行</span>
+      </div>
+      <div
+        className="p-3 text-xs text-text-primary"
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
     </div>
   );
 }

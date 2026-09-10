@@ -6,6 +6,7 @@ import "xterm/css/xterm.css";
 import { useTerminalStore } from "@/store/terminal";
 import { useAppConfig } from "@/store/config";
 import { useForwardStore } from "@/store/forward";
+import { useLayoutStore } from "@/store/layout";
 import { emitTerminalOutput } from "@/lib/terminalBus";
 import { recordOutput, commitOperation } from "@/lib/recorder";
 import { registerTerminalInstance, unregisterTerminalInstance } from "@/lib/terminalBridge";
@@ -102,9 +103,11 @@ interface Props {
   hostConfig?: HostConfig | null;
   onRequestAI?: (prompt: string) => void;
   mode?: "ssh" | "local";
+  /** 本实例所属面板 id；与 layout store 的 focusedPaneId 比对，匹配时主动聚焦终端 */
+  paneId?: string;
 }
 
-export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mode = "ssh" }: Props) {
+export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mode = "ssh", paneId }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -114,6 +117,9 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchCase, setSearchCase] = useState(false);
+  // 终端实例是否就绪（term.open 完成后置 true）。用于「面板成为焦点时主动聚焦」的 effect，
+  // 避免 term 还没创建就去 focus。
+  const [termReady, setTermReady] = useState(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   // 把真实 cols/rows 同步给后端 PTY/远端 shell 的函数。
   // 由终端初始化时写入，供「SSH 连接成功 / 本地 PTY 就绪」回调主动调用 ——
@@ -153,6 +159,8 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
   };
   const session = useTerminalStore((s) => s.sessions.find((x) => x.id === sessionId));
   const updateSession = useTerminalStore((s) => s.updateSession);
+  // 当前聚焦面板 id：与 paneId 比对，决定本实例是否应持有键盘焦点
+  const focusedPaneId = useLayoutStore((s) => s.focusedPaneId);
   const appendOutput = useTerminalStore((s) => s.appendOutput);
   const appendCommand = useTerminalStore((s) => s.appendCommand);
   const appTheme = useAppConfig((c) => c.theme);
@@ -273,6 +281,7 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
           term.focus();
           // 尺寸已就位，此时再启动本地 PTY
           startLocalBackend();
+          setTermReady(true);
         });
 
         // 监听容器尺寸变化（切换标签页 display:none、AI 侧栏开合、窗口缩放等），
@@ -385,6 +394,7 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
       unregisterTerminalInstance(sessionId);
       pushSizeRef.current = null;
       clearTimeout(initTimer);
+      setTermReady(false);
       ro?.disconnect();
       if (handleResize) window.removeEventListener("resize", handleResize);
       if (focusHandler && container) {
@@ -424,6 +434,16 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
       const el = containerRef.current;
       // 仅当终端区域实际可见时才聚焦，避免隐藏标签页被强行抢焦点
       if (term && el && el.clientWidth > 0 && el.clientHeight > 0) {
+        // 若用户正聚焦在「终端容器之外」的可输入元素（如 AI 助手输入框、
+        // 主机表单等），不要把它拽回终端，否则会出现「在 AI 框里打不进字」。
+        const ae = document.activeElement as HTMLElement | null;
+        if (
+          ae &&
+          (ae.tagName === "TEXTAREA" || ae.tagName === "INPUT") &&
+          !el.contains(ae)
+        ) {
+          return;
+        }
         term.focus();
       }
     };
@@ -434,6 +454,22 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
       window.removeEventListener("focus", focusTerm);
     };
   }, [sessionId]);
+
+  // 1.5b 面板聚焦联动：当本实例所属面板成为「当前聚焦面板」时主动聚焦终端。
+  // 这覆盖了三种原先 focus 不掉的场景：
+  //   - 初始加载（首个面板即 focusedPane，但 connect 之前的窗口/focus 事件未必触发）
+  //   - 分屏后新面板（splitWith 把新 leaf 设为 focused，新面板的 XTerminal 需主动聚焦）
+  //   - 在多个面板间切换（聚焦变了但窗口本身没有重新获焦）
+  // 用户手动点击终端仍走 focusHandler，两者互补，不冲突。
+  useEffect(() => {
+    if (!paneId || !termReady) return;
+    if (focusedPaneId !== paneId) return;
+    const term = termRef.current;
+    const el = containerRef.current;
+    if (term && el && el.clientWidth > 0 && el.clientHeight > 0) {
+      term.focus();
+    }
+  }, [focusedPaneId, paneId, termReady]);
 
   // 1.6 Ctrl+F / Cmd+F 唤起终端内查找浮层
   useEffect(() => {
@@ -733,7 +769,11 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
     };
 
     return () => disposable.dispose();
-  }, [sessionId, session?.status, appendCommand, mode]);
+    // termReady 必须进依赖：终端是异步创建的（容器尺寸就绪后才 new Terminal），
+    // 首次跑这个 effect 时 termRef.current 还是 null，会直接 return 跳过注册。
+    // 少了它，挂载时就已 connected 的会话（切标签页 / 分屏切回来）永远不会注册
+    // onData —— 表现为终端看得见但敲键盘没反应。
+  }, [sessionId, session?.status, appendCommand, mode, termReady]);
 
   return (
     <div

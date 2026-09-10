@@ -109,6 +109,15 @@ export interface AIProviderConfig {
   model: string;
   temperature: number;
   maxTokens: number;
+  /**
+   * 额外请求体字段，原样平铺进 OpenAI 兼容请求（默认不传 = 行为与以前完全一致）。
+   *
+   * 用途：透传各家网关的私有开关，最典型的是思考型模型的思考开关
+   * （Qwen3 系 `enable_thinking:false`）。这类模型默认会把输出预算先花在
+   * 「思考」上，正文可能一个字都不剩 —— 对 Agent 这种「必须立刻按协议吐命令」
+   * 的场景既烧 token 又容易整个失败。
+   */
+  extraBody?: Record<string, unknown>;
   // 自动分析终端报错：终端输出出现错误关键词时自动唤起 AI 分析
   autoAnalyze?: boolean;
 }

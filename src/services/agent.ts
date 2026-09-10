@@ -7,7 +7,7 @@
 // =====================================================
 
 import { subscribeTerminalOutput } from "@/lib/terminalBus";
-import { AGENT_RUN_START, AGENT_RUN_END, AGENT_DONE } from "./prompts";
+import { AGENT_RUN_START, AGENT_RUN_END, AGENT_DONE, AGENT_PLAN } from "./prompts";
 import { useTerminalStore } from "@/store/terminal";
 
 export { AGENT_RUN_START, AGENT_RUN_END, AGENT_DONE };
@@ -25,6 +25,17 @@ export interface AgentReply {
   /** 结束时的最终总结 */
   finalAnswer: string | null;
   raw: string;
+  /**
+   * 非空表示本次回复是「计划声明」（<<<PLAN>>>）：run() 据此把它存为任务蓝图并继续，
+   * 不会当作命令执行，也不会当作结束。
+   */
+  plan?: string;
+  /**
+   * 为真表示「回复里既无 <<<RUN>>> 也无 <<<DONE>>>，是兜底当作结束」——
+   * run() 据此把模型的「过渡/解释」性裸文本与真正的任务完成区分开，
+   * 避免模型在中间说一句「让我分析一下」就被误判任务结束。
+   */
+  noMarkerFallback?: boolean;
 }
 
 /** 把 <<<RUN>>> 块里的多行内容拆成命令列表（容忍模型自作主张加的序号/列表符号） */
@@ -58,6 +69,21 @@ export function parseAgentReply(text: string): AgentReply {
     };
   }
 
+  // 计划声明：优先于命令执行。run() 据此把计划存为任务蓝图并继续，
+  // 不会当作命令执行，也不会误判为结束。
+  const planIdx = raw.indexOf(AGENT_PLAN);
+  if (planIdx !== -1) {
+    // 提示词约定 <<<PLAN>>> 既做开头也做结尾标记：剥掉结尾那个多余标记，
+    // 避免蓝图文本里混入协议串（会进 UI 计划卡片与后续注入的 pinned 消息）。
+    const plan = raw
+      .slice(planIdx + AGENT_PLAN.length)
+      .trim()
+      .replace(new RegExp(`${escapeRegExp(AGENT_PLAN)}\\s*$`), "")
+      .trim();
+    const before = raw.slice(0, planIdx).trim();
+    return { thought: before, commands: [], done: false, finalAnswer: null, raw, plan };
+  }
+
   const runRegex = new RegExp(
     `${escapeRegExp(AGENT_RUN_START)}([\\s\\S]*?)${escapeRegExp(AGENT_RUN_END)}`
   );
@@ -79,8 +105,8 @@ export function parseAgentReply(text: string): AgentReply {
     }
   }
 
-  // 兜底 2：当成最终结论
-  return { thought: "", commands: [], done: true, finalAnswer: raw, raw };
+  // 兜底 2：当成最终结论（无协议标记，run() 会据此判断是否真的结束）
+  return { thought: "", commands: [], done: true, finalAnswer: raw, raw, noMarkerFallback: true };
 }
 
 function escapeRegExp(s: string): string {
@@ -95,6 +121,8 @@ export interface ExecResult {
   script: string;
   /** 执行本身抛异常时的错误信息（区别于命令返回非 0） */
   error?: string;
+  /** 输出超过缓冲上限被截断（多半是读了二进制 / 命令在死循环刷屏） */
+  flooded?: boolean;
 }
 
 export interface ExecOptions {
@@ -128,6 +156,33 @@ export function flattenCommand(cmd: string): string {
     }
   }
   return out;
+}
+
+/**
+ * 打断远程仍在运行的前台进程，把 shell 抢回可交互状态。
+ *
+ * 这是「装软件装到一半之后满屏乱输出」的根因修复：等待循环超时/被中止时，
+ * 远端那条命令并没有停（可能是 wget 卡在下载、apt 卡在 [Y/n]、编译还在跑），
+ * 它依然占着 PTY 的 stdin。此时本轮后续命令、乃至下一轮 Agent 发下的任何
+ * 脚本，都会被它当成输入吞掉 —— 哨兵错位、退出码丢失、输出张冠李戴，
+ * 模型拿到一堆互相穿插的残片，只能退化成反复发无关探测命令。
+ *
+ * 只做两件事：Ctrl+C 中断前台进程，再补一个空回车逼 shell 刷新提示符。
+ * 中断失败不影响调用方，异常一律吞掉。
+ */
+async function abortRemoteCommand(
+  w: { __termai_writeTerminal?: (sid: string, data: string) => Promise<boolean> },
+  sessionId: string
+): Promise<void> {
+  try {
+    await w.__termai_writeTerminal?.(sessionId, "\x03");
+    await sleep(120);
+    // Ctrl+C 之后 shell 往往要等下一次回车才回显提示符，补一下确认已恢复
+    await w.__termai_writeTerminal?.(sessionId, "\r");
+    await sleep(120);
+  } catch {
+    // 终端已断开等情况下写入会抛错，此时也没有可中断的进程
+  }
 }
 
 /**
@@ -176,11 +231,35 @@ export async function execCommand(
   let sawEnd = false;
   let lastFlush = 0;
   let cleanedLen = 0; // 已清理过的 buffer 长度，下次只扫增量
+  /**
+   * 输出洪水开关。上限按字符而非字节数，够用且和 buffer.length 同口径。
+   *
+   * 真实故障：`cat /usr/local/bin/prometheus` 把 100MB+ 的 ELF 倒进 PTY ——
+   * buffer 一路涨到上百 MB，每 200ms 还要把累积 display 全量推给 UI，
+   * 这一步跑了 320 秒、卡在输出超时，整个终端被乱码刷满。
+   * 这里做兜底：任何命令（含死循环刷屏、无 head 的 journalctl）一旦超过上限，
+   * 立即停止收集并打断远端命令，只保留头尾片段用于判因。
+   */
+  const MAX_BUFFER_CHARS = 600_000;
+  const MAX_DISPLAY_CHARS = 120_000;
+  let flooded = false;
+
+  // 结束哨兵必须「独占一行」才算数，详见 makeSentinelMatcher 的说明。
+  const matchEnd = makeSentinelMatcher(end);
 
   const unsub = subscribeTerminalOutput((sid, data) => {
     if (sid !== sessionId) return;
+    // 已判定洪水：后续数据一律丢弃（远端会被 wait 循环里的中断尽快掐掉）
+    if (flooded) return;
     buffer += data;
-    if (buffer.includes(end)) sawEnd = true;
+    if (buffer.length > MAX_BUFFER_CHARS) {
+      flooded = true;
+      // 保留头尾：头部能看出是什么命令在刷，尾部可能含着结束哨兵/退出码
+      const half = Math.floor(MAX_BUFFER_CHARS / 2);
+      buffer =
+        buffer.slice(0, half) + "\n…（输出过大，中段已丢弃）…\n" + buffer.slice(-half);
+    }
+    if (!sawEnd && matchEnd(buffer)) sawEnd = true;
 
     const now = Date.now();
     if (now - lastFlush >= 200) {
@@ -190,6 +269,12 @@ export async function execCommand(
       const chunk = buffer.slice(cleanedLen);
       cleanedLen = buffer.length;
       if (chunk) display += stripEcho(chunk, begin);
+      // 显示缓冲同样设上限：终端窗口本身有全量输出，这里没必要把上百 MB
+      // 反复推给 UI（那是卡顿的直接来源）。
+      if (display.length > MAX_DISPLAY_CHARS) {
+        const half = Math.floor(MAX_DISPLAY_CHARS / 2);
+        display = display.slice(0, half) + "\n…（更早输出已省略）…\n" + display.slice(-half);
+      }
       opts.onOutput?.(display);
     }
   });
@@ -222,6 +307,8 @@ export async function execCommand(
 
     while (!sawEnd) {
       if (opts.signal?.aborted) break;
+      // 输出洪水：不再等哨兵，立刻跳出并打断远端命令（否则会一直刷到硬超时）
+      if (flooded) break;
       const now = Date.now();
       const elapsed = now - startedAt;
       if (elapsed >= maxTimeoutMs) break;
@@ -231,6 +318,12 @@ export async function execCommand(
         lastLen = buffer.length;
         lastDataAt = Date.now();
       }
+    }
+    // 没能正常收尾（超时 / 用户中止）：远端进程多半还占着 shell 的 stdin。
+    // 不把它打断，本轮后续脚本乃至下一轮 Agent 的命令都会被它当输入吞掉，
+    // 输出彻底错位 —— 详见 abortRemoteCommand 的说明。
+    if (!sawEnd) {
+      await abortRemoteCommand(w, sessionId);
     }
     // 收到结束标记后只需极短缓冲（END 是最后一条输出，后面只剩提示符）
     await sleep(sawEnd ? 80 : 150);
@@ -244,10 +337,10 @@ export async function execCommand(
 
   const parsed = extractResult(buffer, begin, end, exitTag);
   if (parsed) {
-    return { output: parsed.output, exitCode: parsed.exitCode, timedOut, script };
+    return { output: parsed.output, exitCode: parsed.exitCode, timedOut, script, flooded };
   }
   // 兜底：没切到哨兵（脚本回显丢失等极端情况），退化为返回已清理的整段缓冲
-  return { output: cleanTerminalText(buffer), exitCode: null, timedOut, script };
+  return { output: cleanTerminalText(buffer), exitCode: null, timedOut, script, flooded };
 }
 
 export interface BatchExecOptions extends ExecOptions {
@@ -295,6 +388,23 @@ export async function execCommandBatch(
     }
   }
   return results;
+}
+
+/**
+ * 生成「哨兵是否已出现」的判定器。
+ *
+ * 判据是**独占一行**，而不是简单的子串包含 —— PTY 会把整段脚本原样回显回来，
+ * 回显里同样含有 `TERMAI_END_xxx` 字样（形如 `echo "TERMAI_END_xxx"`）。
+ * 若用 includes 判定，命令还没开始执行就会误认为已结束，循环立刻退出，
+ * 慢命令只能拿到残缺输出，且 timedOut=false / exitCode=null 会被上层 isOk()
+ * 当成「执行成功」，AI 会基于假成功继续操作远程主机。
+ *
+ * 返回的判定器内部缓存正则，并先用 includes 做廉价预筛 —— 命中才跑正则，
+ * 避免在大 buffer（cat 大日志）上每次输出都全量匹配。
+ */
+export function makeSentinelMatcher(sentinel: string): (buffer: string) => boolean {
+  const re = new RegExp(`(?:^|\\r?\\n)${sentinel}`);
+  return (buffer: string) => buffer.includes(sentinel) && re.test(buffer);
 }
 
 /** 从缓冲区里切出 BEGIN..END 之间的真实输出，并解析退出码 */
@@ -360,32 +470,114 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * 超长输出聚焦：优先抽取错误/异常行 + 尾部若干行，让 AI 在字符预算内看到
+ * 关键失败信息，而不是被开头几 KB 的正常日志淹没（docker build / npm run
+ * build 失败时，报错几乎总在结尾）。若输出中没有任何错误关键词，则回退为
+ * 原「取前 N 字符」截断，保持向后兼容。
+ */
+/**
+ * 输出清洗：把终端原始输出变成「信息密度高、体量可控」的文本。
+ * 终端输出常带 ANSI 颜色/光标控制符、大量空行、以及几万行的日志（cat 大文件、
+ * find /、journalctl 全量），直接喂给模型既浪费 token 又淹没关键信息。
+ * 只做无损或近无损的收敛：去控制符、压连续空行、超行数时保留头尾、
+ * 单行过长时截断。**不改行内内容**，保证模型仍能读到真实错误原文。
+ */
+// ANSI CSI 序列（颜色/光标控制）。ESC 用运行时拼接：直接写 \x1B 会触发
+// eslint 的 no-control-regex，而这类控制符对模型全是噪音，必须剥掉。
+const ANSI_CSI_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[\\x20-\\x2F]*[@-~]`, "g");
+
+export function sanitizeOutput(text: string, maxLines = 80, maxLineLen = 0): string {
+  // \r 常见于 PTY 进度条回显；ANSI CSI 序列是颜色/光标控制，对模型全是噪音
+  const cleaned = text.replace(/\r/g, "").replace(ANSI_CSI_RE, "");
+  let lines = cleaned.split("\n");
+  if (maxLineLen > 0) {
+    lines = lines.map((l) =>
+      l.length > maxLineLen ? `${l.slice(0, maxLineLen)} …（该行过长已截断）` : l
+    );
+  }
+  // 连续空行压成一个，纯空白行直接去掉
+  const compact: string[] = [];
+  let blank = 0;
+  for (const l of lines) {
+    if (!l.trim()) {
+      blank += 1;
+      if (blank > 1) continue;
+    } else {
+      blank = 0;
+    }
+    compact.push(l);
+  }
+  if (compact.length <= maxLines) return compact.join("\n");
+  const headN = Math.max(1, Math.floor(maxLines * 0.3));
+  const tailN = maxLines - headN;
+  const head = compact.slice(0, headN);
+  const tail = compact.slice(-tailN);
+  return [
+    ...head,
+    `……（已省略 ${compact.length - headN - tailN} 行中间输出）`,
+    ...tail,
+  ].join("\n");
+}
+
+function focusOutput(text: string, budget: number): string {
+  const lines = text.split("\n");
+  const KEY_RE =
+    /error|fail|exception|refused|denied|not found|cannot|unable|traceback|fatal|warning|no such|permission|could not|abort/i;
+  // 错误行也设上限：grep -r / 编译告警这类场景能匹配上千行，全塞进来一样会爆上下文
+  const errorLines = Array.from(new Set(lines.filter((l) => KEY_RE.test(l)))).slice(0, 30);
+  if (errorLines.length === 0) {
+    return text.slice(0, budget);
+  }
+  const tail = lines.slice(-40);
+  const seen = new Set<string>();
+  const picked: string[] = [];
+  for (const l of [...errorLines, ...tail]) {
+    const key = l.trim();
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    picked.push(l);
+  }
+  let result = picked.join("\n");
+  if (result.length > budget) {
+    // 优先保错误行，尾部过长则整体截掉
+    result = errorLines.join("\n");
+  }
+  return result + `\n（已聚焦错误/异常行，原始输出 ${text.length} 字符）`;
+}
+
+/**
  * 把执行结果包装成喂给模型的观察（observation）消息。
  * 支持一次传入多条（批量探测），按条数均摊字符预算，避免单条输出吃满上下文。
  */
 export function buildObservation(
   entries: Array<{ command: string; result: ExecResult }>,
-  maxChars = 6000
+  maxChars = 6000,
+  goal?: string
 ): string {
   const total = Math.max(1, entries.length);
   const lines: string[] = [
     total > 1
-      ? `[系统] 已在终端真实执行 ${entries.length} 条命令，以下是各自的结果。`
+      ? `[系统] 已在终端真实执行 ${entries.length} 条命令，以下是各自结果。`
       : "[系统] 命令已在终端真实执行完毕。",
   ];
 
   entries.forEach((entry, idx) => {
     const { command, result } = entry;
     const perBudget = Math.max(800, Math.floor(maxChars / total));
-    let out = result.output || "(无输出)";
-    let truncated = false;
+    const rawOut = result.output || "(无输出)";
+    // 先做无损清洗（控制符/空行/超长日志），再按预算聚焦，避免噪音行挤占预算
+    let out = sanitizeOutput(rawOut);
+    let truncated = out.length < rawOut.length;
     if (out.length > perBudget) {
-      out = out.slice(0, perBudget);
+      out = focusOutput(out, perBudget);
       truncated = true;
     }
     const exitText = result.exitCode === null ? "未知（未捕获到退出码）" : String(result.exitCode);
     const flags = [
-      result.timedOut ? "（等待输出超时，结果可能不完整）" : "",
+      result.timedOut
+        ? "（等待输出超时被强制终止。最常见原因：命令在等待交互输入——如 [Y/n] 确认、密码、配置向导。若是安装/配置类命令，请加非交互参数（-y、DEBIAN_FRONTEND=noninteractive 等）后重发；若是长耗时任务，请改用后台启动 + 轮询日志的方式）"
+        : "",
       result.error ? ` 执行异常：${result.error}` : "",
     ].join("");
 
@@ -397,13 +589,14 @@ export function buildObservation(
       "```",
       out,
       "```",
-      truncated ? `（输出过长已截断，共 ${result.output.length} 字符）` : ""
+      truncated ? `（输出过长已截断，共 ${rawOut.length} 字符）` : ""
     );
   });
 
   lines.push(
     "",
-    "请基于以上真实输出决定下一步：还需要信息就继续用 <<<RUN>>> 给出命令（彼此无依赖的只读命令请批量一次给出）；信息足够就用 <<<DONE>>> 给出最终总结。"
+    "基于以上真实输出决定下一步：还缺信息就用 <<<RUN>>> 给命令（只读无依赖的可批量一次给）；已达成目标用 <<<DONE>>> 给总结。"
   );
+  if (goal) lines.push(`目标：${goal}`);
   return lines.join("\n");
 }

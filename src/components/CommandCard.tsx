@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { Copy, Play, Pencil, CheckCircle2, AlertTriangle, AlertOctagon, ShieldAlert, Shield } from "lucide-react";
 import type { ParsedCommand } from "@/types";
-import { reviewCommand, type RiskLevel } from "@/services/safety";
+import { reviewCommand, isRunnableLanguage, type RiskLevel } from "@/services/safety";
 
 interface Props {
   command: ParsedCommand;
@@ -23,17 +23,34 @@ const RISK_META: Record<
   critical: { label: "⚠️ 致命风险", color: "text-red-400", bg: "bg-red-900/30 border-red-700/50", icon: AlertOctagon },
 };
 
-export function CommandCard({ command, sessionId, sessionConnected, isProduction, privilege, onRun }: Props) {
+/**
+ * 命令卡片。用 memo 包住：AI 流式输出时整条消息每 60ms 重渲染一次，
+ * 卡片内的命令预览（可能上千字符）不应跟着反复重建。
+ */
+export const CommandCard = memo(function CommandCard({ command, sessionId, sessionConnected, isProduction, privilege, onRun }: Props) {
   const [copied, setCopied] = useState(false);
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState(command.command);
   const [showConfirm, setShowConfirm] = useState(false);
 
-  const review = reviewCommand(command.command, { isProduction,  privilege });
+  // 本地审查结果按命令内容缓存：本组件在流式输出期间会被反复重渲染
+  const review = useMemo(
+    () => reviewCommand(value, { isProduction, privilege }),
+    [value, isProduction, privilege]
+  );
 
-  // 优先展示 AI 在代码块里标注的风险级别（命令级），本地规则结果作为兜底
-  const effectiveRisk: RiskLevel = command.riskLevel || review.riskLevel;
+  // 风险标签与「是否弹确认框」必须来自同一个判定，否则会出现
+  // 「标签写中危、点执行却直接跑了」的自相矛盾。本地规则是唯一权威：
+  // 解析阶段已用本地结果纠正过模型的自评，这里再对两者取高作为兜底。
+  const effectiveRisk: RiskLevel = useMemo(() => {
+    const order: RiskLevel[] = ["none", "low", "medium", "high", "critical"];
+    const a = command.riskLevel ?? review.riskLevel;
+    return order.indexOf(a) >= order.indexOf(review.riskLevel) ? a : review.riskLevel;
+  }, [command.riskLevel, review.riskLevel]);
   const effectiveMeta = RISK_META[effectiveRisk];
+
+  // JSON / YAML / 说明文本这类代码块不是命令，给「执行」按钮只会把内容灌进终端
+  const runnable = isRunnableLanguage(command.language);
 
   const copy = async () => {
     try {
@@ -46,6 +63,7 @@ export function CommandCard({ command, sessionId, sessionConnected, isProduction
   };
 
   const handleRun = () => {
+    if (!runnable) return;
     if (review.requireConfirmation) {
       setShowConfirm(true);
       return;
@@ -55,6 +73,7 @@ export function CommandCard({ command, sessionId, sessionConnected, isProduction
 
   const doRun = () => {
     setShowConfirm(false);
+    if (!runnable) return;
     if (!sessionId || !sessionConnected) {
       alert("请先连接一台 SSH 主机");
       return;
@@ -95,8 +114,14 @@ export function CommandCard({ command, sessionId, sessionConnected, isProduction
           </button>
           <button
             onClick={handleRun}
-            disabled={!sessionConnected}
-            title={sessionConnected ? "在终端执行此命令" : "请先连接主机"}
+            disabled={!sessionConnected || !runnable}
+            title={
+              !runnable
+                ? "该代码块是文件内容/说明文本，不是可执行命令，请复制后自行使用"
+                : sessionConnected
+                  ? "在终端执行此命令"
+                  : "请先连接主机"
+            }
             className="px-2 py-1 text-[11px] rounded bg-success hover:bg-success-hover disabled:bg-bg-hover disabled:text-text-tertiary disabled:cursor-not-allowed text-white flex items-center gap-1"
           >
             <Play size={12} />
@@ -118,7 +143,11 @@ export function CommandCard({ command, sessionId, sessionConnected, isProduction
         </pre>
       )}
 
-      {review.riskDescription && (
+      {/* 只有中危及以上才提示：只读/低危命令挂一个黄色警告条纯属噪音 */}
+      {(effectiveRisk === "medium" ||
+        effectiveRisk === "high" ||
+        effectiveRisk === "critical") &&
+        review.riskDescription && (
         <div className="px-3 py-2 text-xs text-white/80 border-t border-white/10 bg-black/20 flex items-start gap-2">
           <AlertTriangle size={14} className="text-yellow-400 mt-0.5 flex-shrink-0" />
           <div>
@@ -165,4 +194,4 @@ export function CommandCard({ command, sessionId, sessionConnected, isProduction
       )}
     </div>
   );
-}
+});

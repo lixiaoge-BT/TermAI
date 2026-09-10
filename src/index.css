@@ -114,6 +114,8 @@ html.dark {
 .xterm {
   position: relative;
   background-color: var(--terminal-bg) !important;
+  /* 终端内容与边缘的呼吸留白（FitAddon 计算 cols/rows 时会读取并扣除该 padding，不会错位） */
+  padding: 2px 4px 4px 4px;
 }
 
 .xterm .xterm-screen,

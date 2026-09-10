@@ -4,21 +4,35 @@
 // 全程不联网装包、不依赖 vitest，适配受限沙箱环境。
 import { buildSync } from "esbuild";
 import { spawnSync } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, join } from "node:path";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const tests = [
-  "src/services/agent.test.ts",
-  "src/services/safety.test.ts",
-  "src/services/ai.stream.test.ts",
-  "electron/main/socks5.test.ts",
-  "src/store/configImport.test.ts",
-  "src/lib/splitLayout.test.ts",
-  "src/lib/sanitize.test.ts",
-  "src/lib/contextCompression.test.ts",
-  "electron/main/deepLink.test.ts",
-];
+
+/**
+ * 自动发现所有 *.test.ts。
+ * 之前这里是硬编码列表 —— 新写的测试忘了登记就会「不执行但全绿」，
+ * 属于假通过。改为递归扫描，避免再次漏掉。
+ */
+function findTests(dir) {
+  const out = [];
+  let entries;
+  try {
+    entries = readdirSync(join(root, dir), { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    if (e.name === "node_modules" || e.name === "dist-test") continue;
+    const rel = `${dir}/${e.name}`;
+    if (e.isDirectory()) out.push(...findTests(rel));
+    else if (e.name.endsWith(".test.ts")) out.push(rel);
+  }
+  return out;
+}
+
+const tests = [...findTests("src"), ...findTests("electron")].sort();
 
 const bundled = [];
 for (const t of tests) {

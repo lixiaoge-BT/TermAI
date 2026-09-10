@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, memo } from "react";
 import {
   Bot,
   User,
@@ -7,7 +7,6 @@ import {
   Sparkles,
   Trash2,
   PanelRightOpen,
-  PanelRightClose,
   Key,
   Wand2,
   AlertCircle,
@@ -28,11 +27,38 @@ import { useAppConfig } from "@/store/config";
 import { useTerminalStore } from "@/store/terminal";
 import { chatCompletion } from "@/services/ai";
 import { CommandCard } from "./CommandCard";
-import { AgentPanel } from "./AgentPanel";
+import { AgentPanel, type AgentSessionLite } from "./AgentPanel";
+import { useShallow } from "zustand/react/shallow";
 import type { ParsedCommand } from "@/types";
 import { parseCommandsFromMarkdown } from "@/services/safety";
 
 type AIMode = "chat" | "agent";
+
+/**
+ * 只订阅「会话的标量字段」，而不是整个 session 对象。
+ *
+ * 背景：terminal store 的 appendOutput 每来一块终端输出就生成新的 session 对象，
+ * 直接 `useTerminalStore(s => s.getActiveSession())` 会让 AI 侧边栏随每一块输出
+ * 整棵重渲染（里面还带着全部历史消息的 Markdown 解析）。而 UI 真正需要的只是
+ * id / 连接状态 / 用户名 / 主机名这几个标量 —— 用 useShallow 按字段比较后，
+ * 终端刷屏时这里一次都不会重渲染。
+ */
+function useActiveSessionLite(): AgentSessionLite | null {
+  return useTerminalStore(
+    useShallow((s) => {
+      const sess = s.sessions.find((x) => x.id === s.activeSessionId);
+      if (!sess) return null;
+      return {
+        id: sess.id,
+        hostId: sess.hostId,
+        username: sess.username,
+        host: sess.host,
+        hostName: sess.hostName,
+        connected: sess.connected,
+      };
+    })
+  );
+}
 
 const accentGradient = {
   background: "linear-gradient(135deg, var(--accent), var(--accent-hover))",
@@ -58,29 +84,15 @@ export function AISidebar({
     return () => window.removeEventListener("termai:ai-mode", handler);
   }, []);
 
-  const activeSession = useTerminalStore((s) => s.getActiveSession());
+  const activeSession = useActiveSessionLite();
   const hostConfig = useAppConfig((c) =>
     activeSession?.hostId ? c.getHost(activeSession.hostId) : null
   );
   const aiConfig = useAppConfig((c) => c.aiConfig);
 
+  // 收起时整个侧边栏不渲染——入口在顶栏右上角「AI 助手」按钮，不再占用右侧竖条
   if (!open) {
-    return (
-      <button
-        onClick={onToggle}
-        className="h-full border-l border-border-primary bg-bg-secondary hover:bg-bg-tertiary px-1.5 flex flex-col items-center pt-4 gap-3 text-text-secondary hover:text-text-primary w-14 min-w-14 transition-colors"
-        title="打开 AI 助手"
-      >
-        <Sparkles size={20} />
-        <span
-          className="text-[11px] tracking-[0.22em] leading-relaxed"
-          style={{ writingMode: "vertical-rl" }}
-        >
-          AI 助手
-        </span>
-        <PanelRightClose size={14} className="mt-auto mb-3" />
-      </button>
-    );
+    return null;
   }
 
   return (
@@ -366,7 +378,7 @@ function ChatArea({
   hostConfig,
   isProduction,
 }: {
-  session: ReturnType<typeof useTerminalStore.getState>["sessions"][number] | null;
+  session: AgentSessionLite | null;
   hostConfig: ReturnType<typeof useAppConfig.getState>["hosts"][number] | null;
   isProduction?: boolean;
 }) {
@@ -384,6 +396,23 @@ function ChatArea({
   } = useSessionChat(session?.id ?? null);
   const aiConfig = useAppConfig((c) => c.aiConfig);
   const [input, setInput] = useState("");
+  // 输入框 ref：侧边栏从「关闭→打开」时把焦点交还输入框，避免「点开 AI 却打不进字」。
+  // 首次渲染（默认打开）不抢焦点，以免影响终端的初始聚焦。
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // 侧边栏打开时把焦点交到输入框：app 启动默认打开时，终端会在 XTerminal 初始化后用
+  // term.focus() 抢回焦点（后 focus 者胜），终端初始焦点不受影响；用户从关闭切到打开时
+  // ChatArea 重新挂载，此处自然聚焦输入框，避免「点开 AI 却打不进字」。
+  useEffect(() => {
+    textareaRef.current?.focus();
+  }, []);
+  // 终端里输入 `?问题` 唤起 AI 时，把焦点交到输入框，用户能直接接着打字/补充
+  useEffect(() => {
+    const handler = () => {
+      textareaRef.current?.focus();
+    };
+    window.addEventListener("termai:quick-ask", handler);
+    return () => window.removeEventListener("termai:quick-ask", handler);
+  }, []);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -465,11 +494,15 @@ function ChatArea({
     let acc = "";
     let lastFlush = 0;
     try {
-      const { commands } = await chatCompletion({
+      const { commands, truncated } = await chatCompletion({
         config: aiConfig,
         userMessage: content,
         chatHistory: messages,
-        terminalCtx: session,
+        // 终端上下文只在真正发请求时读一次即可；常驻订阅它会让侧边栏
+        // 随着每一块终端输出重渲染（见 useActiveSessionLite 的说明）。
+        terminalCtx: session
+          ? (useTerminalStore.getState().sessions.find((s) => s.id === session.id) ?? null)
+          : null,
         hostConfig,
         signal: controller.signal,
         onToken: (delta) => {
@@ -482,7 +515,12 @@ function ChatArea({
         },
       });
       // 收尾确保完整文本落盘（节流可能漏掉末尾几字）
-      updateMessage(placeholder.id, { content: acc, commands });
+      const finalText =
+        acc +
+        (truncated
+          ? "\n\n> ⚠️ 本条回复因达到模型的**单次输出长度上限**被截断，内容可能不完整。请把问题拆细，或在设置里调大 Max Tokens。"
+          : "");
+      updateMessage(placeholder.id, { content: finalText, commands });
     } catch (e: unknown) {
       if ((e as { name?: string })?.name === "AbortError") {
         updateMessage(placeholder.id, { content: "_请求已取消_" });
@@ -544,15 +582,11 @@ function ChatArea({
             key={m.id}
             role={m.role}
             content={m.content}
-            commands={m.commands && m.commands.length > 0 ? m.commands : parseCommandsFromMarkdown(m.content)}
-            session={session}
+            storedCommands={m.commands}
+            sessionId={session?.id ?? null}
+            sessionConnected={session?.connected ?? false}
             isProduction={isProduction}
             privilege={privilege}
-            onRenderCommandsDone={(cmds) => {
-              if (!m.commands || m.commands.length === 0) {
-                updateMessage(m.id, { commands: cmds });
-              }
-            }}
           />
         ))}
         {isLoading && (
@@ -609,7 +643,12 @@ function ChatArea({
               >
                 <Trash2 size={14} />
               </button>
-              <ContextInfo session={session} host={hostConfig} />
+              <ContextInfo
+                sessionId={session?.id ?? null}
+                sessionConnected={session?.connected ?? false}
+                label={`${session?.username ?? ""}@${session?.hostName || session?.host || ""}`}
+                host={hostConfig}
+              />
             </div>
             <button
               onClick={() => send()}
@@ -647,14 +686,31 @@ function QuickPill({
 }
 
 function ContextInfo({
-  session,
+  sessionId,
+  sessionConnected,
+  label,
   host,
 }: {
-  session: ReturnType<typeof useTerminalStore.getState>["sessions"][number] | null;
+  sessionId: string | null;
+  sessionConnected: boolean;
+  label: string;
   host: ReturnType<typeof useAppConfig.getState>["hosts"][number] | null;
 }) {
   const [open, setOpen] = useState(false);
-  if (!session) {
+  // 会话的「重量字段」（最近输出、命令历史）只在弹层打开时才读取，
+  // 否则终端每来一块输出都会让这个组件重渲染。
+  const detail = useTerminalStore(
+    useShallow((s) => {
+      if (!open) return null;
+      const sess = s.sessions.find((x) => x.id === sessionId);
+      if (!sess) return null;
+      return {
+        recentOutput: sess.recentOutput.slice(-10),
+        history: sess.history.slice(-20),
+      };
+    })
+  );
+  if (!sessionId) {
     return (
       <span className="text-[10px] text-text-secondary inline-flex items-center gap-1">
         <Info size={11} />
@@ -668,19 +724,19 @@ function ContextInfo({
         onClick={() => setOpen((v) => !v)}
         className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-bg-secondary border border-border-primary text-text-secondary hover:text-text-primary"
       >
-        {session.status === "connected" ? (
+        {sessionConnected ? (
           <span className="w-1.5 h-1.5 rounded-full bg-success-text" />
         ) : (
           <span className="w-1.5 h-1.5 rounded-full bg-warning-text" />
         )}
-        {session.username}@{session.hostName || session.host}
+        {label}
         <ChevronDown size={11} />
       </button>
       {open && (
         <div className="absolute bottom-full left-0 mb-2 w-72 p-3 rounded-lg bg-bg-tertiary border border-border-primary shadow-xl text-[11px] space-y-2 z-10">
           <div>
             <div className="text-text-secondary mb-1">主机</div>
-            <div>{session.host}（{session.hostName}）</div>
+            <div>{host?.name ?? "—"}</div>
           </div>
           <div>
             <div className="text-text-secondary mb-1">标签</div>
@@ -695,16 +751,16 @@ function ContextInfo({
             </div>
           </div>
           <div>
-            <div className="text-text-secondary mb-1">最近输出（{session.recentOutput.length} 行）</div>
+            <div className="text-text-secondary mb-1">最近输出（{detail?.recentOutput.length ?? 0} 行）</div>
             <div className="max-h-20 overflow-y-auto bg-bg-secondary rounded p-1.5 font-mono text-[10px] text-text-secondary whitespace-pre-wrap">
-              {session.recentOutput.slice(-10).join("\n") || "（暂无）"}
+              {detail?.recentOutput.join("\n") || "（暂无）"}
             </div>
           </div>
           <div>
-            <div className="text-text-secondary mb-1">命令历史（{session.history.length} 条）</div>
+            <div className="text-text-secondary mb-1">命令历史（{detail?.history.length ?? 0} 条）</div>
             <div className="max-h-20 overflow-y-auto bg-bg-secondary rounded p-1.5 font-mono text-[10px] text-text-secondary space-y-0.5">
-              {session.history.length
-                ? session.history.map((h, i) => <div key={i}>$ {h}</div>)
+              {detail?.history.length
+                ? detail.history.map((h, i) => <div key={i}>$ {h}</div>)
                 : "（暂无）"}
             </div>
           </div>
@@ -732,28 +788,38 @@ function Avatar({ role }: { role: "user" | "assistant" }) {
   );
 }
 
-function MessageBubble({
+/**
+ * 单条消息。
+ * 用 memo 包住：流式输出时 ChatArea 每 60ms 重渲染一次，若不 memo，
+ * 全部历史消息都会被重新解析一遍 Markdown（长对话下明显掉帧）。
+ */
+const MessageBubble = memo(function MessageBubble({
   role,
   content,
-  commands,
-  session,
+  storedCommands,
+  sessionId,
+  sessionConnected,
   isProduction,
   privilege,
-  onRenderCommandsDone,
 }: {
   role: "user" | "assistant" | "system";
   content: string;
-  commands?: ParsedCommand[];
-  session: ReturnType<typeof useTerminalStore.getState>["sessions"][number] | null;
+  storedCommands?: ParsedCommand[];
+  sessionId: string | null;
+  sessionConnected: boolean;
   isProduction?: boolean;
   privilege?: "root" | "sudoer" | "user";
-  onRenderCommandsDone?: (cmds: ParsedCommand[]) => void;
 }) {
-  useEffect(() => {
-    if (commands && commands.length > 0) onRenderCommandsDone?.(commands);
-  }, [commands, onRenderCommandsDone]);
+  // 已持久化过的命令直接复用，否则按内容解析（结果再写回 store，避免每次渲染重解析）
+  const commands = useMemo(
+    () =>
+      storedCommands && storedCommands.length > 0
+        ? storedCommands
+        : parseCommandsFromMarkdown(content),
+    [storedCommands, content]
+  );
 
-  const parts = useMemo(() => splitTextAndCode(content, commands ?? []), [content, commands]);
+  const parts = useMemo(() => splitTextAndCode(content, commands), [content, commands]);
 
   if (role === "system") return null;
 
@@ -775,8 +841,8 @@ function MessageBubble({
               <CommandCard
                 key={part.cmd.id + i}
                 command={part.cmd}
-                sessionId={session?.id ?? null}
-                sessionConnected={session?.connected ?? false}
+                sessionId={sessionId}
+                sessionConnected={sessionConnected}
                 isProduction={isProduction}
                 privilege={privilege}
               />
@@ -786,7 +852,7 @@ function MessageBubble({
       </div>
     </div>
   );
-}
+});
 
 function splitTextAndCode(
   md: string,

@@ -33,6 +33,22 @@ export interface RecordingsManager {
   openDir: () => Promise<void>;
 }
 
+/**
+ * 把展示名写进记录 JSON 的顶层 name 字段。
+ * 内容不是合法 JSON 时原样返回，避免因改名/保存损坏已有记录。
+ */
+function withStoredName(content: string, name?: string): string {
+  if (!name) return content;
+  try {
+    const data = JSON.parse(content) as Record<string, unknown>;
+    if (typeof data !== "object" || data === null) return content;
+    data.name = name;
+    return JSON.stringify(data);
+  } catch {
+    return content;
+  }
+}
+
 export function createRecordingsManager(): RecordingsManager {
   const dir = join(app.getPath("userData"), "recordings");
 
@@ -58,12 +74,15 @@ export function createRecordingsManager(): RecordingsManager {
     let duration = 0;
     let title: string | undefined;
     let type: string | undefined;
+    let nameOverride: string | undefined;
 
     try {
       const raw = await fs.readFile(filePath, "utf8");
       const data = JSON.parse(raw);
       if (typeof data?.durationSec === "number") duration = data.durationSec;
       if (typeof data?.type === "string") type = data.type;
+      // 用户改过的展示名存在 JSON 的 name 字段里；没有则回退为文件名
+      if (typeof data?.name === "string" && data.name.trim()) nameOverride = data.name;
       // 标题优先用会话名，其次用第一条命令
       const meta = data?.meta ?? {};
       title = meta.hostName || meta.host;
@@ -76,7 +95,7 @@ export function createRecordingsManager(): RecordingsManager {
 
     return {
       id,
-      name: id.replace(/\.json$/, ""),
+      name: nameOverride || id.replace(/\.json$/, ""),
       path: filePath,
       size: stat.size,
       createdAt: stat.mtimeMs,
@@ -99,7 +118,8 @@ export function createRecordingsManager(): RecordingsManager {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const id = `rec-${stamp}-${randomUUID().slice(0, 8)}.json`;
     const filePath = join(dir, id);
-    await fs.writeFile(filePath, input.content, "utf8");
+    const displayName = input.name?.trim();
+    await fs.writeFile(filePath, withStoredName(input.content, displayName), "utf8");
     const meta = await readMeta(filePath, id);
     // 用传入的名称覆盖自动 id 名（列表展示用）
     return {
@@ -142,9 +162,22 @@ export function createRecordingsManager(): RecordingsManager {
   const rename = async (id: string, name: string): Promise<RecordingMeta> => {
     const filePath = filePathOf(id);
     if (!filePath) throw new Error("非法的记录文件名");
-    // JSON 文件没有可写的展示名 header，直接更新元信息里的展示名即可
+    const trimmed = name?.trim();
+    if (!trimmed) throw new Error("名称不能为空");
+    // 展示名必须落盘：list() 走 readMeta 从文件内容重建 name，
+    // 只改内存里的对象会在下次刷新时被文件名重新推导覆盖掉。
+    let data: Record<string, unknown> = {};
+    try {
+      data = JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
+      if (typeof data !== "object" || data === null) data = {};
+    } catch {
+      // 文件内容不是合法 JSON（老数据 / 损坏）：保留原内容结构，只补一个 name 字段
+      data = {};
+    }
+    data.name = trimmed;
+    await fs.writeFile(filePath, JSON.stringify(data), "utf8");
     const meta = await readMeta(filePath, id);
-    return { ...meta, name };
+    return { ...meta, name: trimmed };
   };
 
   const openDir = async (): Promise<void> => {

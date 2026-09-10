@@ -90,18 +90,63 @@ if (app.isPackaged) {
   console.info = noop;
 }
 
-/** @type {BrowserWindow | null} */
-let win = null;
-let sshManager = null;
-let localTerminalManager = null;
-let localFsManager = null;
-let recordingsManager = null;
+// ---------- 多窗口模型 ----------
+// 每个窗口一组「窗口内」管理器（SSH / 本地终端），事件只回发给创建它们的窗口，
+// 彻底避免旧实现「开第二个窗口覆盖全局单例 → 旧窗口的事件串进新窗口」的问题。
+// localFs / recordings 与窗口无关，保持全局单例，在 app ready 时初始化一次。
+type SshManagerLike = ReturnType<typeof createSshManager>;
+type TerminalManagerLike = ReturnType<typeof createLocalTerminalManager>;
+interface WindowBundle {
+  win: BrowserWindow;
+  ssh: SshManagerLike;
+  term: TerminalManagerLike;
+}
+const windowBundles = new Map<number, WindowBundle>();
+/** 最近创建的窗口 id：深链无聚焦窗口时优先投给它 */
+let lastWindowId: number | null = null;
+
+let localFsManager: ReturnType<typeof createLocalFsManager> | null = null;
+let recordingsManager: ReturnType<typeof createRecordingsManager> | null = null;
+
+/** 按 IPC 发起方（sender）路由到它所属窗口的管理器组 */
+function bundleOfEvent(evt: { sender: Electron.WebContents }): WindowBundle {
+  const w = BrowserWindow.fromWebContents(evt.sender);
+  const b = w ? windowBundles.get(w.id) : undefined;
+  if (!b) throw new Error("TermAI 窗口未初始化或已关闭");
+  return b;
+}
+
+/** 深链 / 二次启动的目标窗口：聚焦的优先，其次最近创建的，最后任一存活窗口 */
+function getTargetWindow(): BrowserWindow | null {
+  const all = BrowserWindow.getAllWindows();
+  if (all.length === 0) return null;
+  return (
+    all.find((w) => w.isFocused()) ??
+    (lastWindowId !== null ? all.find((w) => w.id === lastWindowId) : undefined) ??
+    all[all.length - 1]
+  );
+}
+
+/** 关闭并清理某个窗口的管理器组（窗口 closed 时调用） */
+function disposeBundle(id: number) {
+  const b = windowBundles.get(id);
+  if (b) {
+    try {
+      b.ssh.disposeAll();
+      b.term.disposeAll();
+    } catch (e) {
+      console.error("[main] 窗口管理器清理失败:", e);
+    }
+    windowBundles.delete(id);
+  }
+  if (lastWindowId === id) lastWindowId = null;
+}
 
 const preload = join(__dirname, "../preload/index.cjs");
 const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 
 async function createWindow() {
-  win = new BrowserWindow({
+  const newWin = new BrowserWindow({
     title: "TermAI - AI 智能终端",
     width: 1440,
     height: 900,
@@ -124,9 +169,9 @@ async function createWindow() {
   // 早已触发完毕 —— 监听器永远收不到事件。后果：堡垒机「首次唤起」TermAI 时，
   // argv 解析成功（[main] ✅ 首次启动 argv 解析到跳转参数），但参数卡在
   // pendingJumpRequest 里推不进渲染层，表现就是「TermAI 弹出来了但只连到本地终端」。
-  win.webContents.on("did-finish-load", () => {
+  newWin.webContents.on("did-finish-load", () => {
     console.log("[main] ✅ 页面加载完成");
-    if (win && !win.isDestroyed() && !win.isVisible()) win.show();
+    if (!newWin.isDestroyed() && !newWin.isVisible()) newWin.show();
 
     // 把启动早期缓存的跳转参数送进渲染层（堡垒机首次唤起走这条路径）。
     if (pendingJumpRequest) {
@@ -136,67 +181,75 @@ async function createWindow() {
         port: pendingJumpRequest.port,
         username: pendingJumpRequest.username,
       });
-      win.webContents.send("jump:connect", pendingJumpRequest);
+      newWin.webContents.send("jump:connect", pendingJumpRequest);
       pendingJumpRequest = null;
     }
   });
 
   // ── ② 兜底显示窗口（在 load 之前启动；放到 await 之后创建等于没有兜底）──────
   const showTimer = setTimeout(() => {
-    if (win && !win.isDestroyed() && !win.isVisible()) win.show();
+    if (!newWin.isDestroyed() && !newWin.isVisible()) newWin.show();
   }, 5000);
-  win.once("closed", () => clearTimeout(showTimer));
+  newWin.once("closed", () => clearTimeout(showTimer));
 
   // ── ③ 加载页面 ──────────────────────────────────────────────────────────────
   if (VITE_DEV_SERVER_URL) {
-    await win.loadURL(VITE_DEV_SERVER_URL);
+    await newWin.loadURL(VITE_DEV_SERVER_URL);
     // 开发期不再自动弹出 DevTools，需要时按 F12 手动打开
-    // win.webContents.openDevTools({ mode: "detach" });
+    // newWin.webContents.openDevTools({ mode: "detach" });
   } else {
     // 生产环境加载打包后的 index.html
     // __dirname 在打包后指向 dist-electron/main，所以 index.html 在 dist/index.html
     const indexHtml = join(__dirname, "../../dist/index.html");
     try {
-      await win.loadFile(indexHtml);
+      await newWin.loadFile(indexHtml);
     } catch (err) {
       console.error("[main] ❌ 加载 index.html 失败:", indexHtml);
       console.error("[main] 错误:", err);
       // 失败时尝试打开 DevTools 以便调试
-      win.webContents.openDevTools({ mode: "detach" });
+      newWin.webContents.openDevTools({ mode: "detach" });
     }
   }
 
   // 同步初始化 SSH Manager 和 Local Terminal Manager，确保渲染进程发起 IPC 时已经就绪
-  sshManager = createSshManager(win);
-  localTerminalManager = createLocalTerminalManager(win);
-  localFsManager = createLocalFsManager();
-  recordingsManager = createRecordingsManager();
-  console.log("[main] SSH Manager 和 Local Terminal Manager 已初始化");
+  // 按窗口注册管理器组：SSH / 本地终端的事件只回发给本窗口。
+  // localFs / recordings 与窗口无关，全局只初始化一次。
+  if (!localFsManager) localFsManager = createLocalFsManager();
+  if (!recordingsManager) recordingsManager = createRecordingsManager();
+  windowBundles.set(newWin.id, {
+    win: newWin,
+    ssh: createSshManager(newWin),
+    term: createLocalTerminalManager(newWin),
+  });
+  lastWindowId = newWin.id;
+  // 窗口关闭：释放它自己的 SSH 连接与本地终端，避免跨窗口泄漏
+  newWin.once("closed", () => disposeBundle(newWin.id));
+  console.log("[main] SSH Manager 和 Local Terminal Manager 已初始化 (window", newWin.id + ")");
 
   // ── ⑤ 双保险：万一 did-finish-load 仍未触发（极端时序 / 页面瞬时完成）──────────
   // 只要页面已就绪就直接补发，避免堡垒机的跳转参数卡死在缓存里。
-  if (pendingJumpRequest && win && !win.isDestroyed() && !win.webContents.isLoading()) {
+  if (pendingJumpRequest && !newWin.isDestroyed() && !newWin.webContents.isLoading()) {
     console.log("[main] 📡 补发缓存的跳转参数（did-finish-load 未触发，兜底直投）:", {
       protocol: pendingJumpRequest.protocol,
       host: pendingJumpRequest.host,
       port: pendingJumpRequest.port,
       username: pendingJumpRequest.username,
     });
-    win.webContents.send("jump:connect", pendingJumpRequest);
+    newWin.webContents.send("jump:connect", pendingJumpRequest);
     pendingJumpRequest = null;
   }
 
   // 监听渲染进程加载失败
-  win.webContents.on("did-fail-load", (_e, errorCode, errorDescription, validatedUrl) => {
+  newWin.webContents.on("did-fail-load", (_e, errorCode, errorDescription, validatedUrl) => {
     console.error(`[main] ❌ 页面加载失败: ${validatedUrl}, code=${errorCode}, desc=${errorDescription}`);
   });
 
   // 监听渲染进程崩溃
-  win.webContents.on("render-process-gone", (_e, details) => {
+  newWin.webContents.on("render-process-gone", (_e, details) => {
     console.error(`[main] ❌ 渲染进程崩溃: reason=${details.reason}, exitCode=${details.exitCode}`);
   });
 
-  win.webContents.setWindowOpenHandler(({ url }) => {
+  newWin.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith("https:") || url.startsWith("http:")) {
       shell.openExternal(url);
     }
@@ -204,23 +257,23 @@ async function createWindow() {
   });
 
   // 快捷键：F12 切换 DevTools（所有模式可用）
-  win.webContents.on("before-input-event", (_event, input) => {
+  newWin.webContents.on("before-input-event", (_event, input) => {
     if (input.type === "keyDown" && input.key === "F12") {
-      if (win.webContents.isDevToolsOpened()) {
-        win.webContents.closeDevTools();
+      if (newWin.webContents.isDevToolsOpened()) {
+        newWin.webContents.closeDevTools();
       } else {
-        win.webContents.openDevTools({ mode: "detach" });
+        newWin.webContents.openDevTools({ mode: "detach" });
       }
     }
   });
 
   // 监听 preload 加载错误
-  win.webContents.on("preload-error", (_e, preloadPath, error) => {
+  newWin.webContents.on("preload-error", (_e, preloadPath, error) => {
     console.error("[main] ❌ preload 加载失败:", preloadPath);
     console.error("[main] 错误:", error?.message || error);
   });
 
-  win.webContents.on("console-message", (_e, level, message, line, sourceId) => {
+  newWin.webContents.on("console-message", (_e, level, message, line, sourceId) => {
     // 捕获渲染进程的 console 输出
     if (level >= 2) {
       console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`);
@@ -239,15 +292,8 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", () => {
-  win = null;
-  if (sshManager) {
-    sshManager.disposeAll();
-    sshManager = null;
-  }
-  if (localTerminalManager) {
-    localTerminalManager.disposeAll();
-    localTerminalManager = null;
-  }
+  // 逐窗口清理管理器组（正常情况下每个窗口 closed 时已各自清理，这里兜底）
+  for (const id of Array.from(windowBundles.keys())) disposeBundle(id);
   if (localFsManager) {
     localFsManager = null;
   }
@@ -259,10 +305,13 @@ app.on("window-all-closed", () => {
 
 app.on("second-instance", (_event, argv) => {
   console.log("[main] second-instance argv:", argv);
-  // 把已有窗口抢到前台（用户感知：堡垒机里再点一下 TermAI 不闪退）
-  if (win) {
-    if (win.isMinimized()) win.restore();
-    win.focus();
+  // 把目标窗口抢到前台（用户感知：堡垒机里再点一下 TermAI 不闪退）。
+  // 用「聚焦优先 / 最新窗口兜底」而不是旧的全局 win 单例——
+  // 旧实现里 win 可能指向已销毁窗口，导致既不聚焦、深链参数也被卡死。
+  const target = getTargetWindow();
+  if (target) {
+    if (target.isMinimized()) target.restore();
+    target.focus();
   }
   // 二次启动：堡垒机再次点击 / deep-link 重新唤起，会带新 argv 入来。
   // 这里解析后立刻转发给渲染层（已有窗口），不走 pendingJumpRequest 缓存。
@@ -302,13 +351,14 @@ app.on("open-url", (event, url) => {
  * 若窗口尚未 ready，请求会暂存到 pendingJumpRequest，等 did-finish-load 再补发。
  */
 function deliverJumpRequest(req: JumpConnectParams) {
+  const target = getTargetWindow();
   if (
-    win &&
-    !win.isDestroyed() &&
-    win.webContents &&
-    !win.webContents.isLoading()
+    target &&
+    !target.isDestroyed() &&
+    target.webContents &&
+    !target.webContents.isLoading()
   ) {
-    win.webContents.send("jump:connect", req);
+    target.webContents.send("jump:connect", req);
     return;
   }
   // 还没 ready 或正在 load，先缓存
@@ -316,9 +366,9 @@ function deliverJumpRequest(req: JumpConnectParams) {
 }
 
 app.on("activate", () => {
-  const allWindows = BrowserWindow.getAllWindows();
-  if (allWindows.length) {
-    allWindows[0].focus();
+  const target = getTargetWindow();
+  if (target) {
+    target.focus();
   } else {
     createWindow();
   }
@@ -358,12 +408,15 @@ ipcMain.handle("secure:decrypt", (_evt, cipher: string) => {
 
 ipcMain.handle("ssh:connect", async (_evt, params, sessionId) => {
   console.log("[main] 收到 ssh:connect, sessionId:", sessionId, "params:", JSON.stringify({ host: params.host, port: params.port, username: params.username, hasPassword: !!params.password }));
-  if (!sshManager) {
-    console.error("[main] SSH Manager 未初始化!");
-    throw new Error("SSH Manager 未初始化");
+  let ssh: SshManagerLike;
+  try {
+    ssh = bundleOfEvent(_evt).ssh;
+  } catch (e) {
+    console.error("[main] SSH Manager 未初始化!", e);
+    throw e;
   }
   try {
-    const result = await sshManager.connect(sessionId, params);
+    const result = await ssh.connect(sessionId, params);
     console.log("[main] ssh:connect 成功:", result);
     return result;
   } catch (err) {
@@ -375,45 +428,36 @@ ipcMain.handle("ssh:connect", async (_evt, params, sessionId) => {
 
 ipcMain.handle("ssh:disconnect", async (_evt, sessionId) => {
   console.log("[main] ssh:disconnect:", sessionId);
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.disconnect(sessionId);
+  return bundleOfEvent(_evt).ssh.disconnect(sessionId);
 });
 
 ipcMain.handle("ssh:write", async (_evt, sessionId, data) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.write(sessionId, data);
+  return bundleOfEvent(_evt).ssh.write(sessionId, data);
 });
 
 ipcMain.handle("ssh:resize", async (_evt, sessionId, cols, rows) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.resize(sessionId, cols, rows);
+  return bundleOfEvent(_evt).ssh.resize(sessionId, cols, rows);
 });
 
-ipcMain.handle("ssh:list-sessions", () => {
-  if (!sshManager) return [];
-  return sshManager.listSessions();
+ipcMain.handle("ssh:list-sessions", (_evt) => {
+  return bundleOfEvent(_evt).ssh.listSessions();
 });
 
 // ---------- 端口转发 ----------
 ipcMain.handle("ssh:forward-local", async (_evt, sessionId, spec) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.forwardLocal(sessionId, spec);
+  return bundleOfEvent(_evt).ssh.forwardLocal(sessionId, spec);
 });
 ipcMain.handle("ssh:forward-remote", async (_evt, sessionId, spec) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.forwardRemote(sessionId, spec);
+  return bundleOfEvent(_evt).ssh.forwardRemote(sessionId, spec);
 });
 ipcMain.handle("ssh:forward-dynamic", async (_evt, sessionId, spec) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.forwardDynamic(sessionId, spec);
+  return bundleOfEvent(_evt).ssh.forwardDynamic(sessionId, spec);
 });
 ipcMain.handle("ssh:list-forwards", async (_evt, sessionId) => {
-  if (!sshManager) return [];
-  return sshManager.listForwards(sessionId);
+  return bundleOfEvent(_evt).ssh.listForwards(sessionId);
 });
 ipcMain.handle("ssh:cancel-forward", async (_evt, sessionId, id) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.cancelForward(sessionId, id);
+  return bundleOfEvent(_evt).ssh.cancelForward(sessionId, id);
 });
 
 ipcMain.handle("win:open-new-window", () => {
@@ -423,70 +467,57 @@ ipcMain.handle("win:open-new-window", () => {
 // ---------- Local Terminal IPC ----------
 
 ipcMain.handle("local-terminal:create", async (_evt, sessionId, shell, cols, rows) => {
-  if (!localTerminalManager) throw new Error("Local Terminal Manager 未初始化");
-  return localTerminalManager.create(sessionId, shell, cols, rows);
+  return bundleOfEvent(_evt).term.create(sessionId, shell, cols, rows);
 });
 
 ipcMain.handle("local-terminal:write", async (_evt, sessionId, data) => {
-  if (!localTerminalManager) throw new Error("Local Terminal Manager 未初始化");
-  return localTerminalManager.write(sessionId, data);
+  return bundleOfEvent(_evt).term.write(sessionId, data);
 });
 
 ipcMain.handle("local-terminal:resize", async (_evt, sessionId, cols, rows) => {
-  if (!localTerminalManager) throw new Error("Local Terminal Manager 未初始化");
-  return localTerminalManager.resize(sessionId, cols, rows);
+  return bundleOfEvent(_evt).term.resize(sessionId, cols, rows);
 });
 
 ipcMain.handle("local-terminal:dispose", async (_evt, sessionId) => {
-  if (!localTerminalManager) throw new Error("Local Terminal Manager 未初始化");
-  return localTerminalManager.dispose(sessionId);
+  return bundleOfEvent(_evt).term.dispose(sessionId);
 });
 
 // ---------- SFTP 文件传输 IPC ----------
 
 ipcMain.handle("sftp:connect", async (_evt, params, sessionId) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.sftpConnect(sessionId, params);
+  return bundleOfEvent(_evt).ssh.sftpConnect(sessionId, params);
 });
 
 ipcMain.handle("sftp:list", async (_evt, sessionId, path) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.sftpList(sessionId, path);
+  return bundleOfEvent(_evt).ssh.sftpList(sessionId, path);
 });
 
 ipcMain.handle("sftp:mkdir", async (_evt, sessionId, path) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.sftpMkdir(sessionId, path);
+  return bundleOfEvent(_evt).ssh.sftpMkdir(sessionId, path);
 });
 
 ipcMain.handle("sftp:remove", async (_evt, sessionId, path, isDir) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.sftpRemove(sessionId, path, isDir);
+  return bundleOfEvent(_evt).ssh.sftpRemove(sessionId, path, isDir);
 });
 
 ipcMain.handle("sftp:rename", async (_evt, sessionId, oldPath, newPath) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.sftpRename(sessionId, oldPath, newPath);
+  return bundleOfEvent(_evt).ssh.sftpRename(sessionId, oldPath, newPath);
 });
 
 ipcMain.handle("sftp:download", async (_evt, sessionId, remotePath, localPath) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.sftpDownload(sessionId, remotePath, localPath);
+  return bundleOfEvent(_evt).ssh.sftpDownload(sessionId, remotePath, localPath);
 });
 
 ipcMain.handle("sftp:upload", async (_evt, sessionId, localPath, remotePath) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.sftpUpload(sessionId, localPath, remotePath);
+  return bundleOfEvent(_evt).ssh.sftpUpload(sessionId, localPath, remotePath);
 });
 
 ipcMain.handle("sftp:realpath", async (_evt, sessionId, path) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.sftpRealpath(sessionId, path);
+  return bundleOfEvent(_evt).ssh.sftpRealpath(sessionId, path);
 });
 
 ipcMain.handle("sftp:disconnect", async (_evt, sessionId) => {
-  if (!sshManager) throw new Error("SSH Manager 未初始化");
-  return sshManager.sftpDisconnect(sessionId);
+  return bundleOfEvent(_evt).ssh.sftpDisconnect(sessionId);
 });
 
 // ---------- 本地文件系统 IPC ----------

@@ -110,6 +110,7 @@ export function SplitView({ onRequestAI }: Props) {
               hostConfig={hostConfig}
               mode={s.host === "local" ? "local" : "ssh"}
               onRequestAI={onRequestAI}
+              paneId={cell?.paneId}
             />
           </div>
         );
@@ -256,7 +257,7 @@ function EmptyPanePrompt({
       </div>
       <h2 className="text-base font-semibold mb-1 text-text-primary">还未连接主机</h2>
       <p className="text-xs mb-4 leading-relaxed text-text-secondary">
-        从左侧主机列表选择一台主机并点击连接，或在终端输入{" "}
+        从左上角主机列表选择一台主机并点击连接，或在终端输入{" "}
         <code className="px-1 rounded bg-bg-hover">?你的问题</code> 直接问 AI。
       </p>
 

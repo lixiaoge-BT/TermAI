@@ -349,9 +349,11 @@ export function createSshManager(win: BrowserWindow): SshManager {
         .on("ready", () => {
           session.info.connected = true;
           // 重连成功后重置计数；首次连接用 'connected'，重连用 'reconnected'
+          // 先取出重连标记再重置：否则 emit 时恒为 false，'reconnected' 分支永远走不到
+          const wasReconnecting = session.reconnecting;
           session.reconnecting = false;
           session.reconnectAttempts = 0;
-          emit("ssh:status", session.id, session.reconnecting ? "reconnected" : "connected");
+          emit("ssh:status", session.id, wasReconnecting ? "reconnected" : "connected");
 
           client.shell(shellOptions(session.cols, session.rows), (err, stream) => {
             if (err) {
@@ -442,7 +444,13 @@ export function createSshManager(win: BrowserWindow): SshManager {
     let jump: { jumpClient: Client; sock: ClientChannel } | undefined;
     if (params.proxyJump) {
       try {
-        session.jumpClient?.end().catch(() => {});
+        // ssh2 的 Client.end() 返回 EventEmitter 而非 Promise，不能 .catch()；
+        // 旧跳板机连接可能已随断开失效，这里只需尽力关闭，失败也不影响重建。
+        try {
+          session.jumpClient?.end();
+        } catch {
+          /* ignore */
+        }
         jump = await acquireJump(params);
         session.jumpClient = jump.jumpClient;
       } catch {

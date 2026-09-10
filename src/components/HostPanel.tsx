@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useMemo } from "react";
+import { useShallow } from "zustand/react/shallow";
 import {
   Server,
   Plus,
@@ -14,8 +15,6 @@ import {
   Search,
   KeyRound,
   ShieldCheck,
-  PanelLeftClose,
-  PanelLeftOpen,
   X as XIcon,
   FolderUp,
   Network,
@@ -40,7 +39,20 @@ interface CtxMenuState {
 
 export function HostPanel({ open, onToggle, onQuickConnect }: Props) {
   const { hosts, hostGroups, addHost, updateHost, removeHost, addHostGroup, removeHostGroup, hostFormOpen, setHostFormOpen, openFileTransfer, openForward, exportHosts, importHosts } = useAppConfig();
-  const { createSession, sessions } = useTerminalStore();
+  // 只订阅动作 + 「每台主机已连接会话数」映射。
+  // sessions 数组在每块终端输出时都会换新引用（recentOutput 变化），
+  // 全量订阅会让主机列表跟着输出流逐块重渲染；映射成计数 + useShallow
+  // 后，只有连接/断开时才触发重渲染。
+  const createSession = useTerminalStore((s) => s.createSession);
+  const connectedCounts = useTerminalStore(
+    useShallow((s) => {
+      const counts: Record<string, number> = {};
+      for (const sess of s.sessions) {
+        if (sess.hostId && sess.connected) counts[sess.hostId] = (counts[sess.hostId] ?? 0) + 1;
+      }
+      return counts;
+    })
+  );
   const [editingId, setEditingId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [ctxMenu, setCtxMenu] = useState<CtxMenuState | null>(null);
@@ -193,23 +205,9 @@ export function HostPanel({ open, onToggle, onQuickConnect }: Props) {
     onQuickConnect?.(session.id);
   };
 
+  // 收起时整个面板不渲染——入口按钮在 Tab 栏左端（Home.tsx），不再占用左侧竖条
   if (!open) {
-    return (
-      <button
-        onClick={onToggle}
-        className="h-full border-r border-border-primary bg-bg-secondary hover:bg-bg-tertiary px-1.5 flex flex-col items-center pt-4 gap-3 text-text-secondary hover:text-text-primary w-14 min-w-14 transition-colors"
-        title="展开主机列表"
-      >
-        <Server size={20} />
-        <span
-          className="text-[11px] tracking-[0.22em] leading-relaxed"
-          style={{ writingMode: "vertical-rl" }}
-        >
-          主机列表
-        </span>
-        <PanelLeftOpen size={14} className="mt-auto mb-3" />
-      </button>
-    );
+    return null;
   }
 
   return (
@@ -227,19 +225,17 @@ export function HostPanel({ open, onToggle, onQuickConnect }: Props) {
         onChange={handleImportFile}
       />
       <div className="px-3 py-3 border-b border-border-primary flex items-center justify-between">
-        <div className="flex items-center gap-2">
+        {/* 点击标题区域即可收起面板（替代原收起小图标按钮） */}
+        <button
+          onClick={onToggle}
+          className="flex items-center gap-2 rounded px-1 -mx-1 py-0.5 hover:bg-bg-hover text-text-primary transition-colors"
+          title="收起主机列表"
+        >
           <Server size={16} className="text-text-link" />
           <span className="text-sm font-semibold">主机列表</span>
           <span className="text-xs text-text-secondary">({hosts.length})</span>
-        </div>
+        </button>
         <div className="flex items-center gap-1">
-          <button
-            onClick={onToggle}
-            className="p-1.5 rounded hover:bg-bg-hover text-text-secondary"
-            title="收起主机列表"
-          >
-            <PanelLeftClose size={16} />
-          </button>
           <div className="relative">
             <button
               onClick={() => setPlusMenuOpen((v) => !v)}
@@ -387,7 +383,7 @@ export function HostPanel({ open, onToggle, onQuickConnect }: Props) {
                     host={h}
                     isActive={h.id === activeHostId}
                     selected={h.id === selectedHostId}
-                    activeSessionsCount={sessions.filter((s) => s.hostId === h.id && s.connected).length}
+                    activeSessionsCount={connectedCounts[h.id] ?? 0}
                     onSelect={() => setSelectedHostId(h.id)}
                     onConnect={() => doConnect(h)}
                     onEdit={() => {
@@ -726,7 +722,9 @@ function HostContextMenu({
   );
 }
 
-function HostFormModal({
+// 导出：Home.tsx 在主机列表收起时也要能渲染此弹窗
+// （SplitView「添加新主机」只置全局 hostFormOpen，而本面板收起时整棵不渲染）
+export function HostFormModal({
   initial,
   prefillGroup,
   allGroups,

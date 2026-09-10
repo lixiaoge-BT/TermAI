@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { HostPanel } from "@/components/HostPanel";
+import { useShallow } from "zustand/react/shallow";
+import type { TerminalSessionState } from "@/types";
+import { HostPanel, HostFormModal } from "@/components/HostPanel";
 import { SplitView } from "@/components/SplitView";
 import { useLayoutStore } from "@/store/layout";
 import { computeLayout, createLeaf, findLeaf, listLeaves, type SplitDirection } from "@/lib/splitLayout";
@@ -14,11 +16,64 @@ import { useAgentStore } from "@/store/agent";
 import { startRecording, isRecording, getElapsed, formatDuration, serializeOperations, stopAllRecordings } from "@/lib/recorder";
 import { Plus, X, LogOut, Server, Sparkles, Terminal as TermIcon, ChevronRight, Moon, Sun, Monitor, Circle, Film, Columns2, Rows2, Square } from "lucide-react";
 
+/**
+ * Tab 栏 / 顶栏 / 状态栏真正需要的会话「轻量视图」。
+ * terminal store 的 sessions 数组在每块终端输出时都会因 recentOutput 变化换新引用，
+ * 直接订阅会让整个 Home（Tab 栏、SplitView、AI 侧栏）跟着输出流逐块重渲染。
+ * 这里映射成轻量对象 + useShallow 浅比较：输出流不再触发重渲染，
+ * 只有标签上可见的字段（状态/连接/命令数）变化才重渲染。
+ * WeakMap 缓存保证「未变化的 session 对象 → 同一个 lite 引用」，浅比较才能命中。
+ */
+interface SessionLite {
+  id: string;
+  hostId?: string;
+  hostName: string;
+  host: string;
+  username: string;
+  connected: boolean;
+  status: TerminalSessionState["status"];
+  errorMsg?: string;
+  startTime?: number;
+  historyLen: number;
+}
+
+const sessionLiteCache = new WeakMap<TerminalSessionState, SessionLite>();
+const toSessionLite = (s: TerminalSessionState): SessionLite => {
+  let lite = sessionLiteCache.get(s);
+  if (!lite) {
+    lite = {
+      id: s.id,
+      hostId: s.hostId,
+      hostName: s.hostName,
+      host: s.host,
+      username: s.username,
+      connected: s.connected,
+      status: s.status,
+      errorMsg: s.errorMsg,
+      startTime: s.startTime,
+      historyLen: s.history.length,
+    };
+    sessionLiteCache.set(s, lite);
+  }
+  return lite;
+};
+
 export default function Home() {
-  const { sessions, activeSessionId, createSession, removeSession, setActiveSession } = useTerminalStore();
+  const sessions = useTerminalStore(useShallow((s) => s.sessions.map(toSessionLite)));
+  const activeSessionId = useTerminalStore((s) => s.activeSessionId);
+  const createSession = useTerminalStore((s) => s.createSession);
+  const removeSession = useTerminalStore((s) => s.removeSession);
+  const setActiveSession = useTerminalStore((s) => s.setActiveSession);
   const getHost = useAppConfig((c) => c.getHost);
   const setTheme = useAppConfig((c) => c.setTheme);
   const currentTheme = useAppConfig((c) => c.theme);
+  // 「添加新主机」弹窗的全局兜底（渲染在下方 FileManager 旁）：
+  // 主机列表收起时 HostPanel 整棵不渲染，SplitView 的 hostFormOpen 没人消费
+  const hostFormOpenG = useAppConfig((c) => c.hostFormOpen);
+  const setHostFormOpenG = useAppConfig((c) => c.setHostFormOpen);
+  const hostGroupsG = useAppConfig((c) => c.hostGroups);
+  const hostsG = useAppConfig((c) => c.hosts);
+  const addHostG = useAppConfig((c) => c.addHost);
   const [aiOpen, setAiOpen] = useState(true);
   const [hostPanelOpen, setHostPanelOpen] = useState(true);
   const [playerOpen, setPlayerOpen] = useState(false);
@@ -305,6 +360,17 @@ export default function Home() {
           <div
             className="h-9 border-b border-border-primary bg-bg-secondary flex items-center overflow-x-auto flex-shrink-0"
           >
+            {/* 主机列表开关：只在面板收起时显示（展开时「主机列表」标题本身可点击收起，
+                再放一个开关就重复了——用户反馈后删去展开态的重复入口） */}
+            {!hostPanelOpen && (
+              <button
+                onClick={() => setHostPanelOpen(true)}
+                className="h-full px-3 border-r border-border-primary flex items-center flex-shrink-0 transition-colors text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+                title="展开主机列表"
+              >
+                <Server size={15} />
+              </button>
+            )}
             {sessions.map((s) => {
               const host = s.hostId ? getHost(s.hostId) : null;
               const isActive = s.id === active?.id;
@@ -407,6 +473,24 @@ export default function Home() {
 
       <FileManager />
       <ForwardManager />
+
+      {/* 主机表单弹窗兜底：仅主机列表收起时渲染（展开时由 HostPanel 内部渲染，
+          承载「编辑主机」流；这里 initial 恒为 null，只服务 SplitView「添加新主机」） */}
+      {!hostPanelOpen && hostFormOpenG && (
+        <HostFormModal
+          initial={null}
+          allGroups={Array.from(
+            new Set(
+              [...hostGroupsG, ...hostsG.map((h) => (h.group || "").trim())].filter(Boolean)
+            )
+          )}
+          onClose={() => setHostFormOpenG(false)}
+          onSave={(data) => {
+            addHostG(data);
+            setHostFormOpenG(false);
+          }}
+        />
+      )}
 
       {/* 底栏状态 */}
       <StatusBar session={active} />
@@ -592,12 +676,20 @@ function TermAIMenu({
 function StatusBar({
   session,
 }: {
-  session: ReturnType<typeof useTerminalStore.getState>["sessions"][number] | undefined;
+  session: SessionLite | undefined;
 }) {
   // 只统计当前终端会话的对话条数（各会话互相独立）
   const msgCount = useChatStore((s) =>
     session ? (s.buckets[session.id]?.messages.length ?? 0) : 0
   );
+  // 渲染优化后 Home 不再随终端输出流重渲染，「连接时长」是渲染时算的，
+  // 没人触发就会冻结。这里在已连接期间自己每秒跳一次（局部状态，只重渲染状态栏）。
+  const [, tickNow] = useState(0);
+  useEffect(() => {
+    if (session?.status !== "connected" || !session?.startTime) return;
+    const timer = window.setInterval(() => tickNow((v) => v + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [session?.status, session?.startTime]);
   return (
     <div
       className="h-6 border-t border-border-primary bg-bg-tertiary text-text-secondary flex items-center px-3 gap-4 text-[10px] flex-shrink-0 overflow-hidden"
@@ -621,7 +713,7 @@ function StatusBar({
         <span className="truncate text-danger-text">错误: {session.errorMsg}</span>
       )}
       <div className="ml-auto flex items-center gap-4 overflow-hidden">
-        <span className="truncate">终端命令历史: {session?.history.length ?? 0}</span>
+        <span className="truncate">终端命令历史: {session?.historyLen ?? 0}</span>
         <span className="truncate">AI 对话: {msgCount} 条</span>
         <span className="text-text-link truncate">TermAI v0.1.0</span>
       </div>
