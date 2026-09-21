@@ -3,7 +3,11 @@ import type { AIProviderConfig } from "@/types";
 import type { RiskLevel } from "@/services/safety";
 import { reviewCommand, isBinaryDumpCommand } from "@/services/safety";
 import { chatCompletionRaw, thinkingDisableExtra } from "@/services/ai";
-import { buildAgentSystemPrompt, AGENT_MAX_BATCH_COMMANDS } from "@/services/prompts";
+import {
+  buildAgentSystemPrompt,
+  AGENT_MAX_BATCH_COMMANDS,
+  AGENT_MAX_SUB_COMMANDS_PER_LINE,
+} from "@/services/prompts";
 import {
   shouldCompress,
   buildCompressionMessages,
@@ -16,10 +20,19 @@ import {
 } from "@/lib/contextCompression";
 import {
   buildObservation,
+  createDupTracker,
+  createFailTreadmill,
+  digestOutput,
   execCommand,
   execCommandBatch,
+  isExecOk,
+  isNoInfoProbeOutput,
   parseAgentReply,
+  probeTargetOf,
+  sanitizeCommandLine,
   sanitizeOutput,
+  shellIncomplete,
+  type DupReason,
   type ExecResult,
 } from "@/services/agent";
 import { useAppConfig } from "./config";
@@ -65,6 +78,35 @@ export interface PendingConfirm {
 
 export type ConfirmDecision = "run" | "skip" | "abort";
 
+/**
+ * 任务级性能度量。
+ *
+ * 这个循环有两个不显眼的耗时来源，此前完全不可观测：
+ *  · 每一轮都要把 system + 计划 + 命令清单 + 全部历史**重新 prefill 一遍**；
+ *  · 上下文压缩本身是**一次完整的额外 LLM 调用**，而且卡在主链路上（await 等它返回）。
+ * 没有度量就只能凭感觉猜「慢在哪」，所以先把它们记下来 —— 这是后续所有优化的判据。
+ */
+export interface AgentMetrics {
+  /** 主循环里的 LLM 调用次数与累计耗时 */
+  llmCalls: number;
+  llmMs: number;
+  /** 其中属于「上下文压缩」的调用次数与累计耗时（隐藏成本） */
+  compressCalls: number;
+  compressMs: number;
+  /** token 用量（需要网关在响应里返回 usage，拿不到时保持 0） */
+  promptTokens: number;
+  completionTokens: number;
+}
+
+const EMPTY_METRICS: AgentMetrics = {
+  llmCalls: 0,
+  llmMs: 0,
+  compressCalls: 0,
+  compressMs: 0,
+  promptTokens: 0,
+  completionTokens: 0,
+};
+
 /** 每个终端会话独立持有一份 Agent 任务状态 */
 export interface AgentBucket {
   phase: AgentPhase;
@@ -87,6 +129,8 @@ export interface AgentBucket {
    * 首次运行 / reset 后清空。
    */
   messages: ChatMessage[];
+  /** 本轮任务的性能度量（耗时 / token），用于定位「慢在哪」 */
+  metrics: AgentMetrics;
 }
 
 // ChatMessage 的唯一定义放在 @/lib/contextCompression，这里引用，避免类型分叉。
@@ -105,6 +149,7 @@ const EMPTY_BUCKET: AgentBucket = {
   liveThought: "",
   plan: "",
   messages: [],
+  metrics: EMPTY_METRICS,
 };
 
 interface AgentState {
@@ -140,9 +185,15 @@ function maxRisk(risks: RiskLevel[]): RiskLevel {
   );
 }
 
-/** 退出码为 0 或没捕获到退出码（但也没抛异常）都算成功 */
+/**
+ * 退出码为 0 或没捕获到退出码（但也没抛异常）都算成功。
+ *
+ * 委托给 isExecOk：还必须检查**分段退出码**。`$?` 只反映最后一条子命令，
+ * `rm /nope; du /tmp` 的末条成功会给出 exitCode 0 —— 若据此标绿并记入台账，
+ * 模型就被喂了一个假成功，之后的判断全错。
+ */
 function isOk(res: ExecResult): boolean {
-  return !res.error && (res.exitCode === 0 || res.exitCode === null);
+  return isExecOk(res);
 }
 
 /**
@@ -374,6 +425,8 @@ export const useAgentStore = create<AgentState>((set, get) => {
         pendingConfirm: null,
         liveThought: "",
         submittedGoal: goal,
+        // 度量每次 run() 从零开始统计（本轮的耗时/token），不跨 run 累积
+        metrics: { ...EMPTY_METRICS },
         // 续跑不清 steps/summary，保留任务连续性；仅首次运行才重置。
         ...(isFresh ? { steps: [], summary: "", plan: "" } : {}),
       });
@@ -388,9 +441,16 @@ export const useAgentStore = create<AgentState>((set, get) => {
       const taskStartedAt = Date.now();
       // 上下文上限：多步任务每轮都回传完整观察，messages 会越来越长，
       // 超过阈值后只保留 system + 最近若干轮，避免 token 线性膨胀、越来越慢越来越贵。
-      // 单条命令观察的字符预算：默认 6000 太烧 token；长输出本来也只取关键错误行+尾部，
-      // 3000 足够模型判断，超长部分靠 focusOutput 的「错误行聚焦」兜住。
-      const OBSERVATION_MAX_CHARS = 3000;
+      // 单条命令观察的字符预算。
+      //
+      // 3000 → 8000 的调整依据：预算现在是「每条保底 800 + 剩余按需分配」
+      // （见 allocateObservationBudget），不再是按条数均摊。之前批量 4 条时
+      // 每条只剩 750 字符 —— `df -h` / `ps aux` / `journalctl` 轻轻超，模型拿到的
+      // 是残片，决策错了反被误判成「空转」。8000 下：单条命令拿到近满额，
+      // 批量 4 条按需分配，短输出不白占预算。
+      // 超长部分仍由 focusOutput 的「头部 20 行 + 错误行 + 尾部 40 行」兜住，
+      // 不会把整段大输出灌进上下文。
+      const OBSERVATION_MAX_CHARS = 8000;
       const MAX_AGENT_MESSAGES = 14;
       // 单任务步数上限（核心节流闸门）：没有它，模型可以无休止打转（实测跑到 64 步仍在
       // 空转），每一步都是一次「system + 计划 + 已执行清单 + 历史摘要」的完整请求，
@@ -409,6 +469,31 @@ export const useAgentStore = create<AgentState>((set, get) => {
         return `${clean.slice(0, headN)}\n……（输出过长，已省略 ${
           clean.length - headN - tailN
         } 字符，完整输出请见终端）\n${clean.slice(-tailN)}`;
+      };
+      /**
+       * 实时流式展示用：只限长，不跑正则清洗。
+       *
+       * execCommand 推上来的 display 已经过 stripEcho → cleanTerminalText 清过 ANSI，
+       * 这里若再对「累积全量文本」跑一次 sanitizeOutput（正则 + split + 逐行遍历），
+       * 就是每 400ms 一次、最长 12 万字符的重复劳动 —— O(n²) 的主要来源。
+       * 完整清洗留给命令结束时的 capOutput。
+       */
+      const capLive = (text: string): string => {
+        if (text.length <= MAX_ITEM_OUTPUT_CHARS) return text;
+        const headN = Math.floor(MAX_ITEM_OUTPUT_CHARS * 0.6);
+        const tailN = MAX_ITEM_OUTPUT_CHARS - headN;
+        return `${text.slice(0, headN)}\n……（输出过长，已省略 ${
+          text.length - headN - tailN
+        } 字符，完整输出请见终端）\n${text.slice(-tailN)}`;
+      };
+      // digestOutput 已下沉到 services/agent.ts（纯函数、可单测）：
+      // 它的「跳过表头取有信息量行」策略直接决定台账能不能替模型省下一轮重跑。
+      /** 展示用短命令：单行命令可能上千字符（输出退化），提示里只回显开头 */
+      const brief = (cmd: string, n = 60): string => (cmd.length > n ? `${cmd.slice(0, n)}…` : cmd);
+      /** 台账行格式：`✓ 命令 → 输出片段` */
+      const logLine = (icon: string, cmd: string, output?: string): string => {
+        const c = brief(cmd, 80);
+        return output === undefined ? `${icon} ${c}` : `${icon} ${c} → ${digestOutput(output)}`;
       };
       // 批量探测单轮条数上限：一次甩十几条命令既刷屏又难定位，超过的丢弃并告知模型
       const MAX_BATCH_COMMANDS = AGENT_MAX_BATCH_COMMANDS;
@@ -449,6 +534,10 @@ export const useAgentStore = create<AgentState>((set, get) => {
       let noMarkerStreak = 0;
       // 低价值命令连续拒绝计数：被拒轮不建 step、不耗步数预算，需要独立闸门防空转烧钱。
       let lowValueStreak = 0;
+      // 全轮重复命令连续拒绝计数。重复命令被剔除后**台账计数不会增长**（没真的执行），
+      // 所以单靠 dupTracker 无法收敛：模型可以一直重发同一条命令、一直被拒 ——
+      // 每轮都是一次完整 API 往返。同样需要独立闸门兜住。
+      let dupStreak = 0;
 
       // 任务计划蓝图：fresh 运行时由模型 <<<PLAN>>> 给出；续跑时继承 bucket.plan。
       // 它必须在整个任务生命周期内一直可见 —— 压缩/硬截断会把早期的 assistant
@@ -464,7 +553,7 @@ export const useAgentStore = create<AgentState>((set, get) => {
         if (messages.some((m) => m.content.startsWith(PLAN_PIN_PREFIX))) return;
         messages.splice(1, 0, {
           role: "user",
-          content: `${PLAN_PIN_PREFIX}\n${planText}\n（请对照此计划推进：已完成的子目标不要重复做，未完成的继续推进，全部完成后才用 <<<DONE>>> 结束。）`,
+          content: `${PLAN_PIN_PREFIX}\n${planText}\n（对照计划推进：已完成的不重复，未完成的继续，全部完成才 <<<DONE>>>。）`,
         });
       };
 
@@ -479,30 +568,25 @@ export const useAgentStore = create<AgentState>((set, get) => {
         it.timedOut ? "⏱" : it.status === "done" ? "✓" : it.status === "skipped" ? "⊘" : "✗";
       if (!isFresh) {
         for (const st of bucket.steps) {
-          for (const it of st.items) executedLog.push(`${itemIcon(it)} ${it.command}`);
+          for (const it of st.items) executedLog.push(logLine(itemIcon(it), it.command, it.output));
         }
       }
-      // 命令执行统计（去重执行用）：key 为归一化后的命令，value 为执行次数与最后一次是否成功。
+      // 命令执行统计（去重执行用）：实现下沉到 services/agent.ts 的 createDupTracker
+      // （纯函数 + 单测锁定了「把查询包进 `A && B` 里也算重复」这条关键语义）。
       // 「重复执行同一条已成功的命令」是空转烧 token 的典型形态（模型忘了自己跑过什么，
       // 或陷入重试死循环）。已执行清单是软提示，这里是硬闸门。
-      const execStats = new Map<string, { n: number; lastOk: boolean }>();
-      const normalizeCmd = (cmd: string) => cmd.trim().replace(/\s+/g, " ");
-      const recordExec = (cmd: string, ok: boolean) => {
-        const key = normalizeCmd(cmd);
-        const prev = execStats.get(key);
-        execStats.set(key, { n: (prev?.n ?? 0) + 1, lastOk: ok });
-      };
+      const dupTracker = createDupTracker();
       const EXEC_LOG_PREFIX = "## 已执行过的命令清单（勿重复）";
       const syncExecLog = () => {
         if (executedLog.length === 0) return;
-        // 只保留最近 30 条展示（防止清单本身养肥成新负担、每轮都吃 token）。
-        // 注意：重复命令的硬闸门用的是 execStats（完整历史），不受此窗口影响——
+        // 展示窗口 12 条：条目现在自带输出片段，比纯命令行更长。
+        // 注意：重复命令的硬闸门用的是 dupTracker（完整历史），不受此窗口影响——
         // 所以缩小展示窗口不会放过重复执行。
-        const capped = executedLog.slice(-30);
+        const capped = executedLog.slice(-12);
         const content =
-          `${EXEC_LOG_PREFIX}\n以下命令已在本次任务中真实执行过（✓ 成功 / ✗ 失败 / ⊘ 用户跳过 / ⏱ 超时被杀）：\n` +
+          `${EXEC_LOG_PREFIX}\n已真实执行过（✓ 成功 / ✗ 失败 / ⊘ 跳过 / ⏱ 超时），→ 后为该命令的输出片段：\n` +
           `${capped.join("\n")}\n` +
-          `（除非明确需要复查同一项（须在思考里说明理由），严禁再次执行相同或等效命令；需要新信息请用新的命令获取。）`;
+          `（信息够就直接引用片段，不要为了「再看一眼」而重跑。）`;
         const idx = messages.findIndex((m) => m.content.startsWith(EXEC_LOG_PREFIX));
         if (idx !== -1) {
           messages[idx] = { role: "user", content };
@@ -512,6 +596,56 @@ export const useAgentStore = create<AgentState>((set, get) => {
           messages.splice(planIdx !== -1 ? planIdx + 1 : 1, 0, { role: "user", content });
         }
       };
+
+      /**
+       * 同源探测统计：识别「对着同一个 host:端口反复换 URL 路径」的空转。
+       *
+       * 真实故障：模型为了确认 Prometheus 有没有起来，连发了 `/-/health`、`/metrics`、
+       * `/-/status`、`/api/v1/status` 等多个**猜出来的**路径，其中大部分是 404。
+       * 它换了字符串，但没有换方法 —— 因为它每次拿到的都是「404 page not found」
+       * 这种没有区分度的输出，从里面学不到任何东西。
+       *
+       * 这里只做「告知」，不拦截：拦截会连带挡掉合法的复查，而告知不会 ——
+       * 与「信息只增不减」的原则一致。
+       */
+      const probeTarget = probeTargetOf;
+      /** target → { n 总探测次数, streak 连续无有效信息次数 } */
+      const probeStats = new Map<string, { n: number; streak: number }>();
+      const recordProbe = (cmd: string, res: ExecResult) => {
+        const target = probeTarget(cmd);
+        if (!target) return;
+        const noInfo = isNoInfoProbeOutput(res.output);
+        const prev = probeStats.get(target) ?? { n: 0, streak: 0 };
+        probeStats.set(target, { n: prev.n + 1, streak: noInfo ? prev.streak + 1 : 0 });
+      };
+      /** 本轮命令若命中「同源反复探测」，返回一段提醒；否则空串 */
+      const probeNoteFor = (cmds: string[]): string => {
+        for (const c of cmds) {
+          const target = probeTarget(c);
+          if (!target) continue;
+          const st = probeStats.get(target);
+          // streak >= 2：连续两次没拿到有效信息，说明「换路径」这条路已经走不通了
+          if (!st || st.streak < 2) continue;
+          return (
+            `\n\n[系统] 你已经第 ${st.n + 1} 次探测 \`${target}\`，此前连续 ${st.streak} 次都没拿到有效信息（404 / 连接失败 / 空输出）。\n` +
+            `**不要再换 URL 路径了** —— 换路径不算换方法。请先确认这个端口有没有服务在监听：\`ss -lntp | grep -w 端口\`（无 ss 用 \`netstat -lntp | grep 端口\`）；\n` +
+            `端口没有 Listen 就转去查进程（\`ps aux | grep 服务名\`）、启动日志（\`journalctl -u 服务名 -n 50 --no-pager\`）与配置文件。`
+          );
+        }
+        return "";
+      };
+
+      /**
+       * 同类错误连击：识别「换了写法、没换方法」的原地打转。
+       *
+       * 与 probeStats 的区别：probeStats 只认 curl/wget 对同一 host:port 的探测；
+       * 这里认的是**任意命令的同类失败** —— 例如对着挂载点反复 `rm -rf`，每轮都拿到
+       * `Operation not permitted`，但命令文本每轮都不同（路径越列越细），
+       * 文本去重抓不到，只有错误签名能抓到。
+       *
+       * 同样只告知、不拦截。
+       */
+      const failTreadmill = createFailTreadmill();
 
       /**
        * 硬截断兜底：压缩失败或压缩不划算时保底，保证上下文不会无限膨胀。
@@ -530,6 +664,15 @@ export const useAgentStore = create<AgentState>((set, get) => {
       const COMPRESS_TRIGGER = 12;
       const MAX_CONTEXT_TOKENS = 24000;
       const KEEP_RECENT = 6;
+
+      // 性能度量：每个 run() 一份，主循环与压缩调用都往里累加，实时落到 bucket 供 UI 展示。
+      const metrics: AgentMetrics = { ...EMPTY_METRICS };
+      const patchMetrics = () => patchBucket(sessionId, { metrics: { ...metrics } });
+      const addUsage = (u?: { promptTokens: number; completionTokens: number }) => {
+        if (!u) return;
+        metrics.promptTokens += u.promptTokens;
+        metrics.completionTokens += u.completionTokens;
+      };
 
       const maybeCompress = async () => {
         if (
@@ -557,15 +700,22 @@ export const useAgentStore = create<AgentState>((set, get) => {
           return;
         }
 
+        const compressStartedAt = Date.now();
         try {
           const summary = await chatCompletionRaw({
-            config: aiConfig,
+            // 必须用 agentConfig 而不是 aiConfig：压缩是**整条链路里单次输入最大**的
+            // 一次调用（要吞掉上万 token 的历史 transcript），而 aiConfig 没带
+            // thinkingDisableExtra —— 思考型模型（实测 Qwen/Qwen3.5-9B）会先在这么长的
+            // 输入上跑一整段思考链，再给摘要。表现就是「AI 卡住很久、界面上什么都没发生」：
+            // 它不建 step、不显进度，只有 this 一次阻塞往返。关掉思考后这一步直接砍掉大半。
+            config: agentConfig,
             messages: buildCompressionMessages({
               goal,
               previousSummary,
               transcript: renderTranscript(toSummarize),
             }),
             signal: abort.signal,
+            onMeta: (meta) => addUsage(meta.usage),
           });
           const next = assembleCompressedMessages({ system, goal, summary, recent });
 
@@ -580,6 +730,13 @@ export const useAgentStore = create<AgentState>((set, get) => {
         } catch {
           // 压缩失败（网络/超时）：硬截断兜底，不影响任务继续
           hardTrim();
+        } finally {
+          // 无论成败，这次额外往返的时间和 token 都已经花掉了 —— 必须计入。
+          // 压缩开销是最容易被忽略的一块：它不占「步骤」，UI 上看不出任何痕迹，
+          // 但每次都是一次完整的 LLM 往返。
+          metrics.compressCalls += 1;
+          metrics.compressMs += Date.now() - compressStartedAt;
+          patchMetrics();
         }
       };
 
@@ -631,29 +788,14 @@ export const useAgentStore = create<AgentState>((set, get) => {
               patchBucket(sessionId, { liveThought: replyText });
             }
           };
-          try {
-            replyText = await chatCompletionRaw({
-              config: agentConfig,
-              messages,
-              signal: abort.signal,
-              onToken: (delta) => {
-                replyText += delta;
-                updateLive();
-              },
-              onMeta: (meta) => {
-                if (meta.truncated) truncated = true;
-              },
-            });
-          } catch (e) {
-            // 瞬时空响应：复杂上下文下弱模型偶发空回复（不是配错模型）。
-            // 配错模型（如 OCR/嵌入）两次都是空 → 重试仍空，抛上去给外层走原
-            // 「请检查模型名」的报错。瞬时 provider 抖动 / 模型偶发空 → 重试命中。
-            const msg = (e as Error)?.message ?? String(e);
-            if (!msg.startsWith("模型未返回任何内容")) throw e;
-            replyText = "";
-            truncated = false;
+          /**
+           * 调一次模型。耗时与 token 用量统一在这里记账 —— 放在 finally 里，
+           * 保证失败/超时的那一轮同样被计入（它同样是真实花掉的时间与费用）。
+           */
+          const callModel = async (): Promise<string> => {
+            const callStartedAt = Date.now();
             try {
-              replyText = await chatCompletionRaw({
+              return await chatCompletionRaw({
                 config: agentConfig,
                 messages,
                 signal: abort.signal,
@@ -663,8 +805,27 @@ export const useAgentStore = create<AgentState>((set, get) => {
                 },
                 onMeta: (meta) => {
                   if (meta.truncated) truncated = true;
+                  addUsage(meta.usage);
                 },
               });
+            } finally {
+              metrics.llmCalls += 1;
+              metrics.llmMs += Date.now() - callStartedAt;
+              patchMetrics();
+            }
+          };
+          try {
+            replyText = await callModel();
+          } catch (e) {
+            // 瞬时空响应：复杂上下文下弱模型偶发空回复（不是配错模型）。
+            // 配错模型（如 OCR/嵌入）两次都是空 → 重试仍空，抛上去给外层走原
+            // 「请检查模型名」的报错。瞬时 provider 抖动 / 模型偶发空 → 重试命中。
+            const msg = (e as Error)?.message ?? String(e);
+            if (!msg.startsWith("模型未返回任何内容")) throw e;
+            replyText = "";
+            truncated = false;
+            try {
+              replyText = await callModel();
             } catch {
               throw e;
             }
@@ -752,22 +913,43 @@ export const useAgentStore = create<AgentState>((set, get) => {
           const allCandidates = parsed.commands.map((cmd, i) => ({ cmd, review: reviews[i] }));
           const sliced = canBatch ? allCandidates.slice(0, MAX_BATCH_COMMANDS) : [allCandidates[0]];
           const droppedOverflow = allCandidates.length - sliced.length;
-          const droppedInteractive = sliced
+
+          // 单行净化：`;` / `&&` 串在引擎眼里永远只是「一条命令」—— 单轮条数上限
+          // （4 条）与风险确认粒度都看不见它，跨轮去重台账在首次下发时也全是 0。
+          // 实测出现过「一行内把同一条子命令逐字重复约 46 次」：整条原样下发，
+          // 把终端刷成一面墙，还大概率因超出 PTY 行缓冲而丢掉尾部哨兵。
+          // 逐字重复的子命令直接折叠；剩余子命令超过上限、或整行过长的整条拒绝，
+          // 并要求模型拆成多轮（静默截断会让它以为命令跑完了，反而更糟）。
+          const cleaned = sliced.map((c) => ({ ...c, clean: sanitizeCommandLine(c.cmd) }));
+          const dedupedTotal = cleaned.reduce((n, c) => n + c.clean.dedupedCount, 0);
+          const usable = cleaned
+            .filter((c) => c.clean.overflow.length === 0)
+            .map((c) => ({ ...c, cmd: c.clean.command }));
+          const rejectedPacked = cleaned
+            .filter((c) => c.clean.overflow.length > 0)
+            .map((c) => ({ cmd: c.cmd, cleanup: c.clean }));
+
+          const droppedInteractive = usable
             .filter((c) => INTERACTIVE_CMD_RE.test(c.cmd))
             .map((c) => c.cmd);
+          // 结构残缺的命令（`for x in *` 缺 done、`if` 缺 fi、引号不闭合…）：单独下发会让
+          // 远端 shell 停在续行提示符上等输入，这一步直接挂到硬超时（实测 300s 不动），
+          // 而且残留的半个结构还会吃掉下一条命令。必须拦下并要求补全。
+          const droppedIncomplete = usable.filter((c) => shellIncomplete(c.cmd)).map((c) => c.cmd);
           // dump 二进制：`cat 可执行文件` 会把上百 MB 乱码灌进 PTY（实测一步卡 320 秒、
           // 刷满整个终端、把后续所有输出淹掉）。必须在解析后硬拦，见 isBinaryDumpCommand。
-          const droppedBinary = sliced.filter((c) => isBinaryDumpCommand(c.cmd)).map((c) => c.cmd);
-          const picked = sliced.filter(
+          const droppedBinary = usable.filter((c) => isBinaryDumpCommand(c.cmd)).map((c) => c.cmd);
+          const picked = usable.filter(
             (c) =>
               !LOW_VALUE_CMD_RE.test(c.cmd) &&
               !INTERACTIVE_CMD_RE.test(c.cmd) &&
-              !isBinaryDumpCommand(c.cmd)
+              !isBinaryDumpCommand(c.cmd) &&
+              !shellIncomplete(c.cmd)
           );
-          const droppedLowValue = sliced.filter((c) => LOW_VALUE_CMD_RE.test(c.cmd)).map((c) => c.cmd);
+          const droppedLowValue = usable.filter((c) => LOW_VALUE_CMD_RE.test(c.cmd)).map((c) => c.cmd);
 
           if (picked.length === 0) {
-            // 连续 3 轮全部是低价值命令：说明模型卡死在空转里且没听懂纠正，
+            // 连续 3 轮全部被拒：说明模型卡死在自己的输出模式里且没听懂纠正，
             // 再喂系统消息也只是白烧 API 调用（这些轮不建 step、不耗步数预算，
             // 只有任务总超时兜底）。到点强制收尾，让人接手。
             lowValueStreak += 1;
@@ -775,26 +957,55 @@ export const useAgentStore = create<AgentState>((set, get) => {
               patchBucket(sessionId, {
                 phase: "done",
                 summary:
-                  `[任务未完成] 模型连续 ${lowValueStreak} 轮只给出无信息量的空转命令（清屏/echo 等），已强制结束。` +
+                  `[任务未完成] 模型连续 ${lowValueStreak} 轮给出的命令都无法执行` +
+                  `（空转命令 / 单行过载 / 结构残缺 / 交互式 / dump 二进制），已强制结束。` +
                   `进度已保留，请把目标描述得更具体后再次点「开始接管」。`,
                 goal: "",
               });
               return;
             }
+            // 拒绝原因必须分开说 —— 旧文案一律说「空转命令」，但「一行里塞太多子命令」
+            // 是完全不同的病：模型会以为自己发的是合法命令，于是反复重发同一条。
+            const reasons: string[] = [];
+            if (rejectedPacked.length > 0) {
+              const first = rejectedPacked[0];
+              reasons.push(
+                `你给出的命令 \`${brief(first.cmd)}\` 在**一行里塞了过多子命令**` +
+                  `（\`;\` / \`&&\` 串联后仍有 ${first.cleanup.subCommandCount} 条，上限 ${AGENT_MAX_SUB_COMMANDS_PER_LINE} 条），已整条拒绝执行。` +
+                  `请拆成多轮，每轮只推进一个子目标。`
+              );
+            }
+            if (droppedLowValue.length > 0) {
+              reasons.push(
+                `你给出的命令 \`${droppedLowValue.join("`、`")}\` 属于拿不到任何新信息的空转命令` +
+                  `（清屏 / echo 打标记 / 查历史 / 无参数 cat 等），已拒绝执行。`
+              );
+            }
+            if (droppedInteractive.length > 0) {
+              reasons.push(
+                `\`${droppedInteractive.join("`、`")}\` 是交互式 / 会挂住终端的命令，已拒绝执行。` +
+                  `看进程请用 \`ps aux --sort=-%cpu | head -20\`；看实时负载用 \`uptime\` 或 \`top -b -n 1 | head -20\`；长输出自带 \`| head -N\`。`
+              );
+            }
+            if (droppedIncomplete.length > 0) {
+              reasons.push(
+                `\`${brief(droppedIncomplete[0])}\` 的命令结构**没写完**已拒绝执行：` +
+                  `shell 复合结构必须整段给出（\`for\`/\`while\` 要有配对的 \`done\`、\`if\` 要有 \`fi\`、\`case\` 要有 \`esac\`、引号与括号要闭合）。` +
+                  `半截结构下发后，终端会停在续行提示符 \`>\` 上一直等输入，只能等超时。` +
+                  `**优先用单条命令**（例如删除目录里除某项外全部内容：\`find . -maxdepth 1 -mindepth 1 ! -name 要保留的名字 -exec rm -rf {} +\`），确实要写循环就把整段写完整。`
+              );
+            }
+            if (droppedBinary.length > 0) {
+              reasons.push(
+                `\`${droppedBinary.join("`、`")}\` 是在 dump 二进制/库/设备/私钥文件，已拒绝执行 —— ` +
+                  `把一个可执行文件的二进制内容倒进终端会灌进上百 MB 乱码，刷满屏幕并让后续所有输出错位。` +
+                  `要确认某个可执行文件是否装好、是什么东西，请用：\`file 路径\`、\`ls -la 路径\`、\`路径 --version\`（或 \`command -v 名字\`）。`
+              );
+            }
             messages.push({
               role: "user",
               content:
-                `[系统] 你给出的命令 \`${droppedLowValue.join("`、`")}\` 属于拿不到任何新信息的空转命令` +
-                `（清屏 / echo 打标记 / 查历史 / 无参数 cat 等），已拒绝执行。\n` +
-                (droppedInteractive.length > 0
-                  ? `另外 \`${droppedInteractive.join("`、`")}\` 是交互式 / 会挂住终端的命令，已拒绝执行。` +
-                    `看进程请用 \`ps aux --sort=-%cpu | head -20\`；看实时负载用 \`uptime\` 或 \`top -b -n 1 | head -20\`；长输出自带 \`| head -N\`。\n`
-                  : ``) +
-                (droppedBinary.length > 0
-                  ? `另外 \`${droppedBinary.join("`、`")}\` 是在 dump 二进制/库/设备/私钥文件，已拒绝执行 —— ` +
-                    `把一个可执行文件的二进制内容倒进终端会灌进上百 MB 乱码，刷满屏幕并让后续所有输出错位。\n` +
-                    `要确认某个可执行文件是否装好、是什么东西，请用：\`file 路径\`、\`ls -la 路径\`、\`路径 --version\`（或 \`command -v 名字\`）。\n`
-                  : ``) +
+                `[系统] ${reasons.join("\n")}\n` +
                 `**请直接给出能推进目标的具体命令**（例如带明确对象与输出限制的查看、检测、安装命令）；` +
                 `若信息已足够，请用 <<<DONE>>> 给出最终总结。`,
             });
@@ -803,46 +1014,141 @@ export const useAgentStore = create<AgentState>((set, get) => {
           }
           // 本轮确实有命令进入执行 → 清空空转计数（走到这里说明 picked.length > 0）
           lowValueStreak = 0;
+          // 告知类：本轮对命令做过什么改动，必须说清 —— 模型看不见引擎的净化，
+          // 不告诉它就会以为命令原样执行了，下一轮再发一遍同样的东西。
+          const advisories: string[] = [];
+          if (dedupedTotal > 0) {
+            advisories.push(
+              `本轮有 ${dedupedTotal} 个子命令是**逐字重复**的，已自动折叠为一次执行` +
+                `（在一条命令里重复同一条子命令属于输出退化，系统会折叠，但你应该重新组织命令）。`
+            );
+          }
+          for (const r of rejectedPacked) {
+            advisories.push(
+              `命令 \`${brief(r.cmd)}\` 一行里仍有 ${r.cleanup.subCommandCount} 个子命令` +
+                `（超过上限 ${AGENT_MAX_SUB_COMMANDS_PER_LINE} 条），已拒绝执行，请拆成多轮。`
+            );
+          }
+          if (droppedIncomplete.length > 0) {
+            advisories.push(
+              `命令 \`${brief(droppedIncomplete[0])}\` 的结构**没写完**（缺少配对的 \`done\`/\`fi\`/\`esac\`，或引号未闭合），已拒绝执行 —— ` +
+                `半截结构下发后终端会停在续行提示符 \`>\` 上一直等输入。请补全后重发，或改用单条命令。`
+            );
+          }
           if (droppedOverflow > 0) {
             // 必须说清「为什么只跑了一条」。旧文案只报「只执行了前 N 条」，
             // 模型不知道真实原因（混了写命令 → 整批降级为单条），下一轮照旧把
             // 「只读探测 + 安装」混在一起提交，于是永远在探测、永远不安装。
             const blockedByWrite = !canBatch && allCandidates.length > 1;
-            const reason = blockedByWrite
-              ? `这批命令里混有写操作或需要确认的命令，出于安全本轮只执行了第 1 条 ` +
-                `\`${sliced[0]?.cmd ?? ""}\`。**写命令（安装 / 改配置 / 启停服务）必须独占一轮单独发**，` +
-                `不要和只读探测混在同一批；被挡下的只读探测可以留到下一轮再批量发。`
-              : `本轮你一次提交了 ${allCandidates.length} 条命令，超过单轮上限，` +
-                `只执行了前 ${picked.length} 条。`;
+            advisories.push(
+              blockedByWrite
+                ? `这批命令里混有写操作或需要确认的命令，出于安全本轮只执行了第 1 条 ` +
+                    `\`${sliced[0]?.cmd ?? ""}\`。**写命令（安装 / 改配置 / 启停服务）必须独占一轮单独发**，` +
+                    `不要和只读探测混在同一批；被挡下的只读探测可以留到下一轮再批量发。`
+                : `本轮你一次提交了 ${allCandidates.length} 条命令，超过单轮上限，` +
+                    `只执行了前 ${picked.length} 条。`
+            );
+          }
+          if (advisories.length > 0) {
             messages.push({
               role: "user",
               content:
-                `[系统] ${reason}\n` +
+                `[系统] ${advisories.join("\n")}\n` +
                 (droppedInteractive.length > 0
                   ? `已额外拦掉交互式命令 \`${droppedInteractive.join("`、`")}\`（会卡住终端）；` +
                     `改用在前面提示过的非交互写法。\n`
                   : ``) +
-                `请聚焦：每轮最多 ${MAX_BATCH_COMMANDS} 条，且只给与当前子目标直接相关的命令。`,
+                `请聚焦：每轮最多 ${MAX_BATCH_COMMANDS} 条，每条最多 ${AGENT_MAX_SUB_COMMANDS_PER_LINE} 个子命令，` +
+                `且只给与当前子目标直接相关的命令。`,
             });
           }
 
-          const commandsToRun = picked.map((c) => c.cmd);
-          const reviewsToRun = picked.map((c) => c.review);
-
-          // 重复命令硬闸门：同一条命令已成功执行过 ≥2 次 → 拒绝再跑（不消耗执行与终端时间，
-          // 也不再为它产生新的观察消息）。允许执行 1~2 次是给「启动后复查状态」留余量。
-          const dupStat = execStats.get(normalizeCmd(commandsToRun[0]));
-          if (dupStat && dupStat.n >= 2 && dupStat.lastOk) {
+          // 重复命令硬闸门（**两道网，阈值一致**：本命令 / 本命令族已成功跑过 ≥2 次
+          // → 第 3 次拒绝。允许 1~2 次是给「写操作后复查状态」留余量）。
+          //
+          // ① 逐字重复：同一个字面量第 3 次出现。
+          // ② **同族变体**：同一目标换 flag / 套 `| head`（`ls -1` → `ls -1t | head -1`
+          //    → `ls -la`）。为什么必须有这道网：① 只在「同一字面量第 3 次」时才拦，
+          //    而换个参数写法就是一条全新键、从头计数 —— 实测截图里模型在同一个目录上
+          //    连跑 5 条变体全部放行（探针复现：第 6 条 `ls -1` 才被拦），于是它可以
+          //    永远「换个角度再看一眼」。族计数只覆盖只读白名单命令，且**写命令执行后
+          //    清空**（装完/改完再看一眼是合法复查，不是空转）。
+          //
+          // 另外两个此前漏掉的地方：
+          // ① 旧实现只看 `commandsToRun[0]`，批量里的第 2~4 条**从来没被检查过** ——
+          //    而批量只读探测恰恰是最主要的执行路径；
+          // ② 旧实现命中就整轮 `continue` —— 于是 `[新命令A, 重复命令, 新命令B]` 会拿
+          //    A、B 给重复命令陪葬。现在只剔除重复的那条，其余照常执行。
+          const blockedReasons = new Map<string, DupReason>();
+          const runnable = picked.filter((c) => {
+            const r = dupTracker.dupReason(c.cmd);
+            if (!r) return true;
+            blockedReasons.set(c.cmd, r);
+            return false;
+          });
+          const droppedDup = [...blockedReasons.keys()];
+          const normCmd = (c: string) => c.trim().replace(/\s+/g, " ");
+          const whyOf = (cmd: string): string => {
+            const r = blockedReasons.get(cmd);
+            if (!r) return "";
+            if (r.kind === "exact") return `\`${cmd}\`：本次任务中已成功执行过，结果已知`;
+            const sib = r.siblings.filter((s) => s !== normCmd(cmd));
+            const sibText = sib.length > 0 ? sib.map((s) => `\`${s}\``).join("、") : "同目标的其它写法";
+            return `\`${cmd}\`：与已成功执行过的 ${sibText} 是**同一目标的同类查询**（只换了参数写法），结果不会变`;
+          };
+          if (runnable.length === 0) {
+            // 全轮都是重复命令 → 拒绝本轮。**把它此前拿到的输出片段一并回填**，
+            // 这样它不必为了「再看一眼」再多花一轮往返。
+            const backfill = droppedDup
+              .map((c) => {
+                const d = dupTracker.lastDigest(c);
+                return d ? `\n- \`${c}\` 此前输出：${d}` : `\n- \`${c}\``;
+              })
+              .join("");
+            const reasons = droppedDup.map((c) => `- ${whyOf(c)}`).join("\n");
+            dupStreak += 1;
+            if (dupStreak >= 3) {
+              // 连拒 3 轮仍只会重发旧命令：它已经拿不回新信息了，继续喂系统消息只是
+              // 白烧 API（这些轮不建 step、不耗步数预算，只有任务总超时能兜）。
+              patchBucket(sessionId, {
+                phase: "done",
+                summary:
+                  `[任务未完成] 模型连续 ${dupStreak} 轮只重复已执行过的命令` +
+                  `（含换参数写法重看同一目标的同类查询），已强制结束。\n\n` +
+                  `当前命令结果都在下面这条已执行清单里：\n` +
+                  `${executedLog.slice(-12).join("\n")}\n\n` +
+                  `如需继续，请把下一步说清楚（或直接指出卡在哪），再点「开始接管」。`,
+                goal: "",
+              });
+              return;
+            }
             messages.push({
               role: "user",
               content:
-                `[系统] 命令 \`${commandsToRun[0]}\` 在本次任务中已成功执行过 ${dupStat.n} 次，` +
-                `为避免重复消耗已拒绝再次执行。**请直接采用它此前的输出继续推进**；` +
-                `若确实需要新信息，请换一条不同的命令；若信息已足够，请用 <<<DONE>>> 给出总结。`,
+                `[系统] 本轮命令已拒绝执行，避免重复消耗。原因：\n${reasons}\n` +
+                `以下是它们此前的输出片段：${backfill}\n` +
+                `**请直接采用这些结果继续推进**；若确实需要新信息，请换**不同目标或不同维度**的命令` +
+                `（换目标路径、换观察角度），而不是换参数写法重看同一处；` +
+                `若信息已足够，请用 <<<DONE>>> 给出总结。`,
             });
             hardTrim();
             continue;
           }
+          dupStreak = 0;
+          if (droppedDup.length > 0) {
+            // 部分命中：说清「为什么这批少跑了几条」，否则模型看到条数对不上会重发一遍。
+            const reasons = droppedDup.map((c) => `- ${whyOf(c)}`).join("\n");
+            messages.push({
+              role: "user",
+              content:
+                `[系统] 本轮里的 ${droppedDup.map((c) => `\`${c}\``).join("、")} 已剔除，` +
+                `结果已知、无需重看。原因：\n${reasons}\n` +
+                `其余命令照常执行；需要它们的结果请直接引用上面的台账片段。`,
+            });
+          }
+
+          const commandsToRun = runnable.map((c) => c.cmd);
+          const reviewsToRun = runnable.map((c) => c.review);
 
           const stepId = uid();
           const step: AgentStep = {
@@ -891,7 +1197,7 @@ export const useAgentStore = create<AgentState>((set, get) => {
             if (decision === "skip") {
               updateStepItem(sessionId, stepId, 0, { status: "skipped", error: "用户跳过" });
               updateStep(sessionId, stepId, { status: "skipped", finishedAt: Date.now() });
-              executedLog.push(`⊘ ${commandsToRun[0]}`);
+              executedLog.push(logLine("⊘", commandsToRun[0]));
             messages.push({
               role: "user",
               content: `[系统] 命令 \`${commandsToRun[0]}\` 被用户跳过，未执行。请换用更安全的只读方式继续，或信息足够时用 <<<DONE>>> 给出结论。`,
@@ -910,7 +1216,7 @@ export const useAgentStore = create<AgentState>((set, get) => {
               maxTimeoutMs,
               signal: abort.signal,
               onItemStart: (i) => updateStepItem(sessionId, stepId, i, { status: "running" }),
-              onItemOutput: (i, out) => updateStepItem(sessionId, stepId, i, { output: capOutput(out) }),
+              onItemOutput: (i, out) => updateStepItem(sessionId, stepId, i, { output: capLive(out) }),
               onItemDone: (i, res) =>
                 updateStepItem(sessionId, stepId, i, {
                   status: isOk(res) ? "done" : "failed",
@@ -926,8 +1232,12 @@ export const useAgentStore = create<AgentState>((set, get) => {
             commandsToRun.forEach((c, i) => {
               const r = results[i];
               const ok = !!r && isOk(r) && !r.timedOut;
-              recordExec(c, ok);
-              executedLog.push(`${r ? (r.timedOut ? "⏱" : isOk(r) ? "✓" : "✗") : "?"} ${c}`);
+              dupTracker.record(c, ok, r?.output);
+              if (r) recordProbe(c, r);
+              if (r) failTreadmill.observe(r.output ?? "", isOk(r) && !r.timedOut);
+              executedLog.push(
+                logLine(r ? (r.timedOut ? "⏱" : isOk(r) ? "✓" : "✗") : "?", c, r?.output)
+              );
             });
             updateStep(sessionId, stepId, { status: "done", finishedAt: Date.now() });
             // 批量里若有命令触发输出洪水（读了二进制 / 死循环刷屏），必须点名说清，
@@ -939,9 +1249,16 @@ export const useAgentStore = create<AgentState>((set, get) => {
                   `（典型原因：读取了二进制/可执行文件，或命令死循环刷屏）。请不要再发同类命令；` +
                   `要确认程序/包请用 \`file 路径\`、\`ls -la 路径\`、\`路径 --version\`、\`command -v 名字\`。`
                 : "";
+            // 两类告知互斥：探测告知更具体（带替代命令），命中时不再叠加通用失败告知，
+            // 否则同一轮塞两段「换方法」提示会互相稀释。
+            const probeNote = probeNoteFor(commandsToRun);
             messages.push({
               role: "user",
-              content: buildObservation(entries, OBSERVATION_MAX_CHARS, goal) + floodedNote,
+              content:
+                buildObservation(entries, OBSERVATION_MAX_CHARS, goal) +
+                floodedNote +
+                probeNote +
+                (probeNote ? "" : failTreadmill.note()),
             });
             hardTrim();
             continue;
@@ -955,12 +1272,12 @@ export const useAgentStore = create<AgentState>((set, get) => {
               timeoutMs,
               maxTimeoutMs,
               signal: abort.signal,
-              onOutput: (out) => updateStepItem(sessionId, stepId, 0, { output: capOutput(out) }),
+              onOutput: (out) => updateStepItem(sessionId, stepId, 0, { output: capLive(out) }),
             });
           } catch (e) {
             const msg = (e as Error)?.message ?? String(e);
-            recordExec(command, false);
-            executedLog.push(`✗ ${command}`);
+            dupTracker.record(command, false);
+            executedLog.push(logLine("✗", command));
             updateStepItem(sessionId, stepId, 0, { status: "failed", error: msg });
             updateStep(sessionId, stepId, { status: "failed", finishedAt: Date.now() });
             messages.push({
@@ -978,8 +1295,10 @@ export const useAgentStore = create<AgentState>((set, get) => {
             timedOut: res.timedOut,
             error: res.error,
           });
-          executedLog.push(`${res.timedOut ? "⏱" : isOk(res) ? "✓" : "✗"} ${command}`);
-          recordExec(command, isOk(res) && !res.timedOut);
+          executedLog.push(logLine(res.timedOut ? "⏱" : isOk(res) ? "✓" : "✗", command, res.output));
+          dupTracker.record(command, isOk(res) && !res.timedOut, res.output);
+          recordProbe(command, res);
+          failTreadmill.observe(res.output ?? "", isOk(res) && !res.timedOut);
           updateStep(sessionId, stepId, {
             status: isOk(res) ? "done" : "failed",
             finishedAt: Date.now(),
@@ -995,12 +1314,15 @@ export const useAgentStore = create<AgentState>((set, get) => {
             ? `\n\n[系统] 这条命令的输出**过大，已被强制截断并中断执行**（典型原因：读取了二进制/可执行文件，或命令在死循环刷屏）。\n` +
               `请**不要**再发同类命令。要确认某个程序/包是否装好、是什么东西，正确做法是：\`file 路径\`、\`ls -la 路径\`、\`路径 --version\`、\`command -v 名字\`。`
             : "";
+          const probeNote = probeNoteFor([command]);
           messages.push({
             role: "user",
             content:
               buildObservation([{ command, result: res }], OBSERVATION_MAX_CHARS, goal) +
               partialNote +
-              floodedNote,
+              floodedNote +
+              probeNote +
+              (probeNote ? "" : failTreadmill.note()),
           });
           hardTrim();
         }
@@ -1105,6 +1427,7 @@ export function useSessionAgent(sessionId?: string | null) {
     pendingConfirm: bucket.pendingConfirm,
     liveThought: bucket.liveThought,
     plan: bucket.plan,
+    metrics: bucket.metrics,
     autoRunMedium,
     setGoal: (g: string) => key && setGoalFn(key, g),
     setAutoRunMedium,

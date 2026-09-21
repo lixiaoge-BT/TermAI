@@ -59,11 +59,38 @@ export function thinkingDisableExtra(model: string): Record<string, unknown> | u
   return /\bqwen3(\.\d+)?\b/i.test(model) ? { enable_thinking: false } : undefined;
 }
 
-/** 一次请求的元信息：用于感知输出被 max_tokens 截断 */
+/** 一次请求的元信息：用于感知输出被 max_tokens 截断、并采集 token 用量 */
 export interface RequestMeta {
   finishReason?: string;
   /** finish_reason === "length"：模型还没说完就被 max_tokens 截断 */
   truncated: boolean;
+  /**
+   * 本次请求的 token 用量。非流式响应默认带；流式需要 stream_options.include_usage，
+   * 网关不认该字段时会被自动摘掉（见 streamUsageEnabled），此时为 undefined。
+   */
+  usage?: { promptTokens: number; completionTokens: number };
+}
+
+/**
+ * 是否给流式请求附带 stream_options.include_usage。
+ *
+ * 流式响应**默认不返回 usage**，必须显式索取。但这是往请求体里塞的**新增顶层字段**，
+ * 严格网关可能不认并直接 400 —— 那就不是「看不到统计」，而是把 Agent 整个搞挂。
+ * 所以它被设计成**可失败的优化**：一旦被拒就永久关掉，只付一次性的重试代价。
+ * （教训来自 enable_thinking：多塞字段被网关拒过。）
+ */
+let streamUsageEnabled = true;
+
+/** 从响应体的 usage 里取出 token 数；字段缺失或非法时返回 undefined */
+export function pickUsage(u: unknown): { promptTokens: number; completionTokens: number } | undefined {
+  if (!u || typeof u !== "object") return undefined;
+  const o = u as { prompt_tokens?: unknown; completion_tokens?: unknown };
+  if (o.prompt_tokens === undefined && o.completion_tokens === undefined) return undefined;
+  const num = (v: unknown): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  };
+  return { promptTokens: num(o.prompt_tokens), completionTokens: num(o.completion_tokens) };
 }
 
 /** 可重试错误（限流 / 5xx / 网络抖动 / 网关不支持流式） */
@@ -210,7 +237,8 @@ async function attemptChat(
   signal: AbortSignal | undefined,
   onToken: ((delta: string) => void) | undefined,
   timeouts: { totalMs: number; idleMs: number },
-  onMeta?: (meta: RequestMeta) => void
+  onMeta: ((meta: RequestMeta) => void) | undefined,
+  withStreamUsage: boolean
 ): Promise<string> {
   const url = `${config.baseUrl.replace(/\/$/, "")}/chat/completions`;
   // 总超时覆盖「发请求 → 读完响应」全过程；外部 signal（用户点停止）依然生效。
@@ -231,6 +259,8 @@ async function attemptChat(
           temperature: config.temperature,
           max_tokens: config.maxTokens,
           stream: !!onToken,
+          // 流式默认不带 usage，这里显式索取（网关不认时由 requestChat 摘掉并永久禁用）
+          ...(withStreamUsage ? { stream_options: { include_usage: true } } : {}),
           // 各家网关的私有开关（如 Qwen3 的 enable_thinking）原样平铺。
           // 默认 undefined → 完全不影响既有请求体。
           ...(config.extraBody ?? {}),
@@ -269,7 +299,11 @@ async function attemptChat(
       // 部分网关放在 message.reasoning 里，两种都认，只用来判因、不参与输出。
       const reasoning: string =
         data?.choices?.[0]?.message?.reasoning_content ?? data?.choices?.[0]?.message?.reasoning ?? "";
-      onMeta?.({ finishReason, truncated: finishReason === "length" });
+      onMeta?.({
+        finishReason,
+        truncated: finishReason === "length",
+        usage: pickUsage(data?.usage),
+      });
       if (!content.trim()) {
         // 空正文分两种，处置完全不同（此前一律怪「模型名配错」，把
         // 「思考吃光预算」也误判成配错模型，误导排查方向）：
@@ -289,6 +323,8 @@ async function attemptChat(
     let buffer = "";
     let full = "";
     let finishReason: string | undefined;
+    /** 用量：开了 include_usage 时，服务端会在最后一个 chunk（choices 为空）里带上 */
+    let usage: { promptTokens: number; completionTokens: number } | undefined;
     /** 收到的思考内容字符数（reasoning_content）：只用于「空正文」时判因 */
     let thinkingChars = 0;
     try {
@@ -309,6 +345,8 @@ async function attemptChat(
             const json = JSON.parse(payload);
             const fr: string | undefined = json?.choices?.[0]?.finish_reason;
             if (fr) finishReason = fr;
+            const u = pickUsage(json?.usage);
+            if (u) usage = u;
             const delta: string | undefined = json?.choices?.[0]?.delta?.content;
             if (delta) {
               full += delta;
@@ -327,7 +365,11 @@ async function attemptChat(
     } finally {
       reader.releaseLock();
     }
-    onMeta?.({ finishReason, truncated: finishReason === "length" });
+    onMeta?.({
+      finishReason,
+      truncated: finishReason === "length",
+      usage,
+    });
 
     // 一个正文 token 都没收到，分两种情况：
     // ① 有思考输出 → 预算被思考吃光，退回非流式也是白搭，按预算不足处理
@@ -374,6 +416,8 @@ async function requestChat(
       const wait = RETRY_BACKOFF_MS[attempt - 1] ?? RETRY_BACKOFF_MS[RETRY_BACKOFF_MS.length - 1];
       await new Promise((r) => setTimeout(r, wait));
     }
+    // 本次尝试是否携带 stream_options（流式且该能力尚未被网关拒过）
+    const withStreamUsage = useStream && streamUsageEnabled;
     try {
       return await attemptChat(
         cfg,
@@ -381,7 +425,8 @@ async function requestChat(
         signal,
         useStream ? onToken : undefined,
         { totalMs, idleMs },
-        onMeta
+        onMeta,
+        withStreamUsage
       );
     } catch (e) {
       lastErr = e;
@@ -406,6 +451,12 @@ async function requestChat(
       if (cfg.extraBody && !droppedExtraBody && (status === 400 || status === 422)) {
         droppedExtraBody = true;
         cfg = { ...cfg, extraBody: undefined };
+        continue;
+      }
+      // stream_options 被网关拒绝：摘掉它并**永久禁用**。多花一次重试，换取
+      // 「加统计」永远不会把原本能跑的请求搞挂；永久禁用保证只付这一次代价。
+      if (withStreamUsage && (status === 400 || status === 422)) {
+        streamUsageEnabled = false;
         continue;
       }
       if (e instanceof OutputBudgetError) throw new Error(OUTPUT_BUDGET_MESSAGE);

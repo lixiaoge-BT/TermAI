@@ -8,6 +8,7 @@ import { useAppConfig } from "@/store/config";
 import { useForwardStore } from "@/store/forward";
 import { useLayoutStore } from "@/store/layout";
 import { emitTerminalOutput } from "@/lib/terminalBus";
+import { filterAgentEchoForDisplay } from "@/lib/agentEcho";
 import { recordOutput, commitOperation } from "@/lib/recorder";
 import { registerTerminalInstance, unregisterTerminalInstance } from "@/lib/terminalBridge";
 import type { HostConfig } from "@/types";
@@ -522,12 +523,15 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
 
       const unsubData = window.localTerminal.onData((sid, data) => {
         if (sid !== sessionId) return;
-        termRef.current?.write(data);
+        // 与 SSH 分支同策略：显示侧剔除 Agent 哨兵包装，广播流保持原始
+        const shown = filterAgentEchoForDisplay(sessionId, data);
+        if (shown) termRef.current?.write(shown);
         // 录制：必须在 stripAnsi 之前采集原始数据，回放才能还原颜色与光标
         recordOutput(sessionId, data);
-        const cleaned = stripAnsi(data);
+        const raw = stripAnsi(data);
         // 广播增量输出：供 Agent 模式实时捕获命令回显（不受 recentOutput 200 行裁剪影响）
-        if (cleaned) emitTerminalOutput(sessionId, cleaned);
+        if (raw) emitTerminalOutput(sessionId, raw);
+        const cleaned = shown === data ? raw : stripAnsi(shown);
         if (cleaned.trim()) {
           appendOutput(sessionId, cleaned, 200);
           tryAutoAnalyze(cleaned);
@@ -574,12 +578,16 @@ export function XTerminal({ sessionId, hostConfig: _hostConfig, onRequestAI, mod
 
     const unsubscribe = window.ssh.onData((sid, data) => {
       if (sid !== sessionId) return;
-      termRef.current?.write(data);
+      // Agent 命令的哨兵包装行只从「显示」里剔除；广播出去的原始流必须原样，
+      // execCommand 靠它收集 buffer 才能判断命令结束（详见 lib/agentEcho）。
+      const shown = filterAgentEchoForDisplay(sessionId, data);
+      if (shown) termRef.current?.write(shown);
       // 录制：必须在 stripAnsi 之前采集原始数据，回放才能还原颜色与光标
       recordOutput(sessionId, data);
-      const cleaned = stripAnsi(data);
+      const raw = stripAnsi(data);
       // 广播增量输出：供 Agent 模式实时捕获命令回显（不受 recentOutput 200 行裁剪影响）
-      if (cleaned) emitTerminalOutput(sessionId, cleaned);
+      if (raw) emitTerminalOutput(sessionId, raw);
+      const cleaned = shown === data ? raw : stripAnsi(shown);
       if (cleaned.trim()) {
         appendOutput(sessionId, cleaned, 200);
         tryAutoAnalyze(cleaned);

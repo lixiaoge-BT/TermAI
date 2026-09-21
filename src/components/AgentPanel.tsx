@@ -72,6 +72,11 @@ export interface AgentSessionLite {
   connected?: boolean;
 }
 
+/** token 数量的人类可读格式：1234 → 1.2k */
+function formatTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
 export function AgentPanel({
   session,
   hostConfig: _hostConfig,
@@ -92,6 +97,7 @@ export function AgentPanel({
     pendingConfirm,
     liveThought,
     plan,
+    metrics,
     setGoal,
     setAutoRunMedium,
     run,
@@ -212,6 +218,22 @@ export function AgentPanel({
         <span className="ml-auto inline-flex items-center gap-1">
           <span className={`px-1.5 py-0.5 rounded ${phaseMeta.className}`}>{phaseMeta.label}</span>
           {steps.length > 0 && <span>{steps.length} 步</span>}
+          {metrics.llmCalls > 0 && (
+            <span
+              className="text-text-tertiary cursor-help"
+              title={
+                `LLM 调用 ${metrics.llmCalls} 次，累计 ${(metrics.llmMs / 1000).toFixed(1)}s\n` +
+                `其中上下文压缩 ${metrics.compressCalls} 次、${(metrics.compressMs / 1000).toFixed(1)}s\n` +
+                `token：输入 ${metrics.promptTokens} / 输出 ${metrics.completionTokens}` +
+                (metrics.promptTokens === 0 ? "\n（网关未返回 usage，token 数据不可用）" : "")
+              }
+            >
+              · AI {(metrics.llmMs / 1000).toFixed(1)}s
+              {metrics.compressMs > 0 && `（压缩 ${(metrics.compressMs / 1000).toFixed(1)}s）`}
+              {(metrics.promptTokens > 0 || metrics.completionTokens > 0) &&
+                ` · ${formatTokens(metrics.promptTokens + metrics.completionTokens)} tok`}
+            </span>
+          )}
         </span>
       </div>
 
@@ -381,8 +403,8 @@ function StepCard({ step }: { step: AgentStep }) {
               <StatusIcon size={10} className={running ? "animate-spin" : ""} />
               {step.status === "done"
                 ? step.items.some((it) => it.exitCode !== null && it.exitCode !== 0)
-                  ? "完成（部分命令返回非 0）"
-                  : "执行完成"
+                  ? "已执行（部分返回非 0）"
+                  : "已执行"
                 : step.status === "failed"
                 ? step.items.find((it) => it.error)?.error ?? "执行失败"
                 : step.status === "skipped"
