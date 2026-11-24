@@ -1,0 +1,6 @@
+﻿s0 = [entered]
+old_style = [error]
+new_exists = [0]
+new_absent = [1]
+kill_absent = [128]
+s9 = [finished]

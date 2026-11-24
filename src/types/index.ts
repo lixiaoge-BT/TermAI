@@ -12,6 +12,7 @@ import type {
   SecureStorageApi,
   RecordingsApi,
   RecordingMeta,
+  AgentRunApi,
   RemoteFileInfo,
   LocalFileInfo,
   SftpProgress,
@@ -33,6 +34,11 @@ declare global {
     localFs: LocalFsApi;
     secureStorage: SecureStorageApi;
     recordings: RecordingsApi;
+    /**
+     * Agent 任务记录与导出。可选：跑在没有 preload 的环境（单元测试、浏览器直开）
+     * 时不存在，调用方必须判空 —— 否则导出功能会把整个面板带崩。
+     */
+    agentRun?: AgentRunApi;
     __termai_debug?: { ping: () => Promise<string> };
     /** 外部唤起（堡垒机 / termai:// 协议）入口 contextBridge */
     __jump?: JumpApi;

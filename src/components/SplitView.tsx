@@ -1,15 +1,58 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { XTerminal } from "@/components/XTerminal";
 import { useLayoutStore } from "@/store/layout";
 import { useTerminalStore } from "@/store/terminal";
 import { useAppConfig } from "@/store/config";
 import { computeLayout, type Rect, type SplitDirection } from "@/lib/splitLayout";
+import type { TerminalSessionState } from "@/types";
 import { LayoutGrid, Server, Plus } from "lucide-react";
+
+/**
+ * 面板排版只需要会话的「标量字段」。
+ *
+ * terminal store 的 appendOutput 每来一块输出就换新的 session 对象；直接
+ * `useTerminalStore(s => s.sessions)` 会让 SplitView 随输出流逐块重渲染，
+ * 而它下面挂着全部 XTerminal 实例 —— 输出风暴（cat 大文件、tail -f）时整个
+ * 渲染线程被稳态占满，按键回调排队，主观感受就是「打不进字 / 空格要等一会儿」。
+ * 映射成只含排版所需字段的小对象 + WeakMap 缓存引用，输出流不再触发重渲染。
+ */
+interface SessionView {
+  id: string;
+  hostId?: string;
+  host: string;
+  connected: boolean;
+  status: TerminalSessionState["status"];
+}
+
+const sessionViewCache = new WeakMap<TerminalSessionState, SessionView>();
+const toSessionView = (s: TerminalSessionState): SessionView => {
+  let v = sessionViewCache.get(s);
+  if (!v) {
+    v = {
+      id: s.id,
+      hostId: s.hostId,
+      host: s.host,
+      connected: s.connected,
+      status: s.status,
+    };
+    sessionViewCache.set(s, v);
+  }
+  return v;
+};
 
 interface Props {
   /** 终端里输入 ?问题 时上抛给 Home 处理 */
   onRequestAI: (prompt: string) => void;
 }
+
+/**
+ * 终端实例做 memo：布局变化（拖分隔条、切分屏）会让 SplitView 重渲染，
+ * 但每个 xterm 的真实 DOM 由它自己管理，跟着父组件重渲染纯属浪费；
+ * 输出风暴叠加布局变化时这点浪费会直接延后按键回显。
+ * props 全是稳定基础值（id / 字符串 / Home 里的 useCallback），比较成本可忽略。
+ */
+const MemoXTerminal = memo(XTerminal);
 
 /**
  * 分屏视图
@@ -24,7 +67,7 @@ interface Props {
  * 分屏入口已上移到 tab 栏，避免每面板重复出现分屏图标。
  */
 export function SplitView({ onRequestAI }: Props) {
-  const sessions = useTerminalStore((s) => s.sessions);
+  const sessions = useTerminalStore(useShallow((s) => s.sessions.map(toSessionView)));
   const getHost = useAppConfig((c) => c.getHost);
   const hostConfigs = useAppConfig((c) => c.hosts);
   const setHostFormOpen = useAppConfig((c) => c.setHostFormOpen);
@@ -105,7 +148,7 @@ export function SplitView({ onRequestAI }: Props) {
               if (cell) focusPane(cell.paneId);
             }}
           >
-            <XTerminal
+            <MemoXTerminal
               sessionId={s.id}
               hostConfig={hostConfig}
               mode={s.host === "local" ? "local" : "ssh"}

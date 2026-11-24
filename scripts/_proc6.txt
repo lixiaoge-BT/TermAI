@@ -1,0 +1,6 @@
+﻿pid=37040
+pid=37240
+pid=40500
+pid=43076
+pid=43536
+crash.log exists=True

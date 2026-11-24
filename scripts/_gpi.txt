@@ -1,0 +1,7 @@
+﻿s0=entered
+s1=gpi-ok
+pid=76664
+ppid=75768
+pri=8
+name=gpiprope.exe
+full=D:\Trae\dist-test\gpiprope.exe

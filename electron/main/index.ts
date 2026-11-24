@@ -1,4 +1,6 @@
-import { app, BrowserWindow, shell, ipcMain, dialog, safeStorage } from "electron";
+import { app, BrowserWindow, shell, ipcMain, dialog, safeStorage, Tray, Menu, nativeImage } from "electron";
+import type { MessageBoxOptions, NativeImage } from "electron";
+import { readFileSync } from "node:fs";
 import { release } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,8 +8,10 @@ import { createSshManager } from "./ssh.js";
 import { createLocalTerminalManager } from "./localTerminal.js";
 import { createLocalFsManager } from "./localFs.js";
 import { createRecordingsManager } from "./recordings.js";
+import { createAgentRunsManager, type AgentRunMeta, type ExportInput } from "./agentRuns.js";
 import { parseJumpArgs, type JumpConnectParams } from "./deepLink.js";
 import { logArgvEntry, logEmptyArgvNotice } from "./argvDebug.js";
+import { installDiagnostics, crashLog, watchRenderer } from "./diagnostics.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -41,7 +45,16 @@ if (process.defaultApp && process.argv.length >= 2) {
  */
 let pendingJumpRequest: JumpConnectParams | null = null;
 
+// 崩溃/退出取证必须在单实例判断之前安装：
+// 被单实例锁踢掉的进程（app.quit + process.exit(0)）也是一次「莫名其妙退出」，
+// 没有这行日志就完全看不出是新起的进程自己退的。
+installDiagnostics();
+
 if (!app.requestSingleInstanceLock()) {
+  crashLog("diag: 未拿到单实例锁 → 本进程主动退出（另一个 TermAI 已在运行）", {
+    exe: process.execPath,
+    argv: process.argv.slice(1),
+  });
   app.quit();
   process.exit(0);
 }
@@ -66,21 +79,10 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 // ---------- 启动期错误兜底 ----------
-// 任何未被捕获的异常都会弹窗展示，避免「启动不了」却无任何提示。
-process.on("uncaughtException", (err) => {
-  console.error("[main] ❌ uncaughtException:", err);
-  try {
-    dialog.showErrorBox(
-      "TermAI 启动失败",
-      `${err?.message || String(err)}\n\n${(err as Error)?.stack || ""}`
-    );
-  } catch {
-    /* 对话框也可能失败，忽略 */
-  }
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("[main] ❌ unhandledRejection:", reason);
-});
+// 未捕获异常 / unhandledRejection 统一由 diagnostics.ts 接管：
+//   ① 全量落盘到 <userData>/logs/crash.log（打包版 console 是 noop，不落盘等于丢失）
+//   ② 只弹一次错误框（原实现每个异常都弹，高频回调连续抛错会连弹到像卡死）
+// 这里不再重复注册，避免同一次异常被处理两遍、弹两个框。
 
 // 生产环境降噪：仅保留 error / warn，避免内部日志泄露到控制台并减少开销
 if (app.isPackaged) {
@@ -107,6 +109,9 @@ let lastWindowId: number | null = null;
 
 let localFsManager: ReturnType<typeof createLocalFsManager> | null = null;
 let recordingsManager: ReturnType<typeof createRecordingsManager> | null = null;
+// Agent 任务记录与导出：与窗口无关（写的是同一份 userData），进程内只建一次。
+// 无状态、无窗口引用，多窗口并发调用安全。
+let agentRunsManager: ReturnType<typeof createAgentRunsManager> | null = null;
 
 /** 按 IPC 发起方（sender）路由到它所属窗口的管理器组 */
 function bundleOfEvent(evt: { sender: Electron.WebContents }): WindowBundle {
@@ -125,6 +130,144 @@ function getTargetWindow(): BrowserWindow | null {
     (lastWindowId !== null ? all.find((w) => w.id === lastWindowId) : undefined) ??
     all[all.length - 1]
   );
+}
+
+// ---------- 系统托盘 ----------
+// 产品语义：点窗口 X **只隐藏到托盘**，进程与 SSH / 终端连接保持存活；
+// 必须走托盘右键菜单「退出」才真正结束进程。
+// 因此 close 事件默认拦下（isQuitting 时才放行），window-all-closed 也不能再无条件 quit。
+let tray: Tray | null = null;
+let isQuitting = false;
+let trayHintShown = false;
+
+/** 托盘图标：优先多尺寸 ico（系统按 DPI 自选），退化为 png */
+function trayIconImage(): NativeImage {
+  const dir = app.isPackaged
+    ? join(process.resourcesPath, "app.asar", "assets", "icons")
+    : join(__dirname, "../../assets/icons");
+  // 实测：nativeImage.createFromBuffer 不解码 ICO（返回 empty，不抛异常），
+  // 所以实际生效的是 icon-32.png；ico 留作候选，将来支持时自动优先。
+  for (const name of ["icon.ico", "icon-32.png", "icon-16.png"]) {
+    try {
+      // 用 readFileSync 而不是 createFromPath：asar 内的路径走 fs 补丁最稳
+      const img = nativeImage.createFromBuffer(readFileSync(join(dir, name)));
+      if (!img.isEmpty()) return img;
+    } catch {
+      /* 换下一个候选 */
+    }
+  }
+  console.warn("[tray] 未找到可用托盘图标，使用空图标");
+  return nativeImage.createEmpty();
+}
+
+/** 把任意存活窗口恢复出来（可能被 hide 或最小化） */
+function restoreMainWindow() {
+  const target = getTargetWindow();
+  if (!target) {
+    void createWindow().catch((e) => console.error("[tray] 新建窗口失败:", e));
+    return;
+  }
+  if (target.isMinimized()) target.restore();
+  if (!target.isVisible()) target.show();
+  target.focus();
+}
+
+/** 首次隐藏时提示一次，避免用户以为「点了 X 就退出了」 */
+function showTrayHintOnce() {
+  if (trayHintShown || !tray) return;
+  trayHintShown = true;
+  if (process.platform !== "win32") return;
+  try {
+    tray.displayBalloon({
+      title: "TermAI 仍在后台运行",
+      content: "窗口已隐藏到系统托盘。左键单击托盘图标可恢复窗口，右键菜单可退出。",
+    });
+  } catch {
+    /* 通知不可用时静默忽略 */
+  }
+}
+
+/** 防止连续点「退出」叠出多个确认框 */
+let quitConfirming = false;
+
+/**
+ * 托盘「退出」的二次确认。
+ * 默认焦点与 ESC 都落在「取消」上：这个动作会断掉所有 SSH / 终端会话，误触代价高。
+ */
+async function confirmQuit() {
+  if (quitConfirming || isQuitting) return;
+  quitConfirming = true;
+  try {
+    const win = getTargetWindow();
+    const options: MessageBoxOptions = {
+      type: "question",
+      buttons: ["退出", "取消"],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      title: "退出 TermAI",
+      message: "确定要退出 TermAI 吗？",
+      detail:
+        "退出后所有 SSH 连接与本地终端会话都会断开。\n\n如果只想暂时收起窗口，点窗口右上角的 × 即可隐藏到托盘，连接不受影响。",
+    };
+    // 窗口处于隐藏状态时**不能**把对话框挂成它的子窗口：
+    // Windows 上模态框会跟着隐藏的父窗口一起不显示，用户会以为「点了退出没反应」。
+    const { response } =
+      win && !win.isDestroyed() && win.isVisible()
+        ? await dialog.showMessageBox(win, options)
+        : await dialog.showMessageBox(options);
+
+    if (response === 0) {
+      console.log("[tray] 用户确认退出");
+      isQuitting = true;
+      app.quit();
+    } else {
+      console.log("[tray] 用户取消退出");
+    }
+  } catch (e) {
+    console.error("[tray] 退出确认失败:", e);
+  } finally {
+    quitConfirming = false;
+  }
+}
+
+function createTray() {
+  if (tray) return;
+  const icon = trayIconImage();
+  if (icon.isEmpty()) {
+    console.warn("[tray] 托盘图标加载为空，跳过创建（避免出现不可见的空白图标）");
+    return;
+  }
+  try {
+    tray = new Tray(icon);
+  } catch (e) {
+    console.error("[tray] 创建托盘失败:", e);
+    return;
+  }
+  console.log("[tray] 托盘图标尺寸:", icon.getSize());
+  tray.setToolTip("TermAI - AI 智能终端");
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: "打开主界面", click: () => restoreMainWindow() },
+      {
+        label: "新建窗口",
+        click: () => {
+          void createWindow().catch((e) => console.error("[tray] 新建窗口失败:", e));
+        },
+      },
+      { type: "separator" },
+      {
+        label: "退出",
+        click: () => {
+          void confirmQuit();
+        },
+      },
+    ])
+  );
+  // Windows：左键单击恢复窗口（右键由 setContextMenu 负责）
+  tray.on("click", () => restoreMainWindow());
+  tray.on("double-click", () => restoreMainWindow());
+  console.log("[tray] 系统托盘已创建");
 }
 
 /** 关闭并清理某个窗口的管理器组（窗口 closed 时调用） */
@@ -164,6 +307,9 @@ async function createWindow() {
     },
   });
 
+  // 窗口级再移除一次：单靠 Menu.setApplicationMenu(null) 在 Windows 上按 Alt 仍会弹出默认菜单
+  newWin.setMenu(null);
+
   // ── ① 关键顺序：did-finish-load 监听必须在 loadURL/loadFile 之前注册 ──────────
   // 原实现把 `await win.loadFile()` 放在注册之前，而 await 返回时 did-finish-load
   // 早已触发完毕 —— 监听器永远收不到事件。后果：堡垒机「首次唤起」TermAI 时，
@@ -192,6 +338,18 @@ async function createWindow() {
   }, 5000);
   newWin.once("closed", () => clearTimeout(showTimer));
 
+  // ── 点 X 只隐藏到托盘 ─────────────────────────────────────────────────────
+  // 真正退出（托盘菜单 / app.quit / 系统关机）时 isQuitting 为 true，放行关闭。
+  // 注意：隐藏不会触发 closed，所以 SSH / 本地终端不会被 dispose，连接保持存活。
+  // 托盘不可用时不能拦 —— 否则窗口一藏就再没有入口，用户只能去任务管理器。
+  newWin.on("close", (e) => {
+    if (isQuitting || !tray) return;
+    e.preventDefault();
+    newWin.hide();
+    console.log("[main] 窗口已隐藏到托盘 (window", newWin.id + ")");
+    showTrayHintOnce();
+  });
+
   // ── ③ 加载页面 ──────────────────────────────────────────────────────────────
   if (VITE_DEV_SERVER_URL) {
     await newWin.loadURL(VITE_DEV_SERVER_URL);
@@ -216,6 +374,7 @@ async function createWindow() {
   // localFs / recordings 与窗口无关，全局只初始化一次。
   if (!localFsManager) localFsManager = createLocalFsManager();
   if (!recordingsManager) recordingsManager = createRecordingsManager();
+  if (!agentRunsManager) agentRunsManager = createAgentRunsManager();
   windowBundles.set(newWin.id, {
     win: newWin,
     ssh: createSshManager(newWin),
@@ -244,10 +403,8 @@ async function createWindow() {
     console.error(`[main] ❌ 页面加载失败: ${validatedUrl}, code=${errorCode}, desc=${errorDescription}`);
   });
 
-  // 监听渲染进程崩溃
-  newWin.webContents.on("render-process-gone", (_e, details) => {
-    console.error(`[main] ❌ 渲染进程崩溃: reason=${details.reason}, exitCode=${details.exitCode}`);
-  });
+  // 渲染进程崩溃 / 无响应 / preload 失败：落盘取证 + 自动恢复（详见 diagnostics.ts）
+  watchRenderer(newWin, "main");
 
   newWin.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith("https:") || url.startsWith("http:")) {
@@ -267,12 +424,6 @@ async function createWindow() {
     }
   });
 
-  // 监听 preload 加载错误
-  newWin.webContents.on("preload-error", (_e, preloadPath, error) => {
-    console.error("[main] ❌ preload 加载失败:", preloadPath);
-    console.error("[main] 错误:", error?.message || error);
-  });
-
   newWin.webContents.on("console-message", (_e, level, message, line, sourceId) => {
     // 捕获渲染进程的 console 输出
     if (level >= 2) {
@@ -283,11 +434,33 @@ async function createWindow() {
 
 app.whenReady().then(() => {
   console.log("[main] Electron app ready, 创建窗口...");
+  // 彻底移除应用菜单栏（File/Edit/View/Window/Help）：autoHideMenuBar 只让它平时隐藏，
+  // Windows 上按 Alt 仍会弹出；置 null 后按 Alt 也不再出现。托盘右键菜单不受影响。
+  Menu.setApplicationMenu(null);
+  // 托盘必须先于窗口建立：窗口初始化过程中一旦出错弹窗，用户仍能从托盘退出
+  createTray();
   try {
     createWindow();
   } catch (e) {
     console.error("[main] 创建窗口失败:", e);
     dialog.showErrorBox("TermAI 启动失败", `${(e as Error)?.message || String(e)}\n\n${(e as Error)?.stack || ""}`);
+  }
+});
+
+app.on("before-quit", () => {
+  // 任何退出路径（托盘菜单 / 系统关机 / 更新器）都要先置位，否则 close 拦截会挡住退出
+  isQuitting = true;
+});
+
+// Windows 注销 / 关机：不能因为「点 X 只隐藏」的拦截把系统关机卡住
+app.on("session-end", () => {
+  isQuitting = true;
+});
+
+app.on("will-quit", () => {
+  if (tray) {
+    tray.destroy();
+    tray = null;
   }
 });
 
@@ -300,7 +473,12 @@ app.on("window-all-closed", () => {
   if (recordingsManager) {
     recordingsManager = null;
   }
-  if (process.platform !== "darwin") app.quit();
+  if (agentRunsManager) {
+    agentRunsManager = null;
+  }
+  // 托盘常驻：窗口被隐藏时不会走到这里；真正关闭（isQuitting）才结束进程。
+  // 没有托盘（创建失败）时保持原有行为，避免留下无法退出的僵尸进程。
+  if (process.platform !== "darwin" && (isQuitting || !tray)) app.quit();
 });
 
 app.on("second-instance", (_event, argv) => {
@@ -308,11 +486,8 @@ app.on("second-instance", (_event, argv) => {
   // 把目标窗口抢到前台（用户感知：堡垒机里再点一下 TermAI 不闪退）。
   // 用「聚焦优先 / 最新窗口兜底」而不是旧的全局 win 单例——
   // 旧实现里 win 可能指向已销毁窗口，导致既不聚焦、深链参数也被卡死。
-  const target = getTargetWindow();
-  if (target) {
-    if (target.isMinimized()) target.restore();
-    target.focus();
-  }
+  // 走 restoreMainWindow：窗口可能已被隐藏到托盘，单纯 focus 不会让它重新出现。
+  if (getTargetWindow()) restoreMainWindow();
   // 二次启动：堡垒机再次点击 / deep-link 重新唤起，会带新 argv 入来。
   // 这里解析后立刻转发给渲染层（已有窗口），不走 pendingJumpRequest 缓存。
   const req = parseJumpArgs(argv || [], "second-instance");
@@ -366,9 +541,8 @@ function deliverJumpRequest(req: JumpConnectParams) {
 }
 
 app.on("activate", () => {
-  const target = getTargetWindow();
-  if (target) {
-    target.focus();
+  if (getTargetWindow()) {
+    restoreMainWindow();
   } else {
     createWindow();
   }
@@ -441,6 +615,12 @@ ipcMain.handle("ssh:resize", async (_evt, sessionId, cols, rows) => {
 
 ipcMain.handle("ssh:list-sessions", (_evt) => {
   return bundleOfEvent(_evt).ssh.listSessions();
+});
+
+// 独立 exec 通道：给状态栏资源采样这类高频只读场景用。
+// 走单独 channel，不写用户 PTY —— 采样命令不会出现在终端里，也不影响正在输入的内容。
+ipcMain.handle("ssh:exec", async (_evt, sessionId, command, timeoutMs) => {
+  return bundleOfEvent(_evt).ssh.exec(sessionId, command, timeoutMs);
 });
 
 // ---------- 端口转发 ----------
@@ -587,4 +767,70 @@ ipcMain.handle("recording:rename", async (_evt, id: string, name: string) => {
 ipcMain.handle("recording:open-dir", async () => {
   if (!recordingsManager) throw new Error("Recordings Manager 未初始化");
   return recordingsManager.openDir();
+});
+
+// ---------- Agent 任务记录（完整输出落盘 + 导出）----------
+// 这几个通道全部由「一次任务」驱动，出错一律返回结构化的 { ok:false }，
+// 不让异常冒泡到渲染进程 —— 落盘失败绝不能把任务主流程带崩。
+
+ipcMain.handle("agent-run:begin", async (_evt, meta: AgentRunMeta) => {
+  if (!agentRunsManager) throw new Error("Agent Runs Manager 未初始化");
+  try {
+    return await agentRunsManager.begin(meta);
+  } catch (e) {
+    console.error("[main] agent-run:begin 失败:", e);
+    return null;
+  }
+});
+
+ipcMain.handle(
+  "agent-run:append",
+  async (_evt, input: Parameters<ReturnType<typeof createAgentRunsManager>["append"]>[0]) => {
+    if (!agentRunsManager) return { ok: false, skipped: "Manager 未初始化" };
+    try {
+      return await agentRunsManager.append(input);
+    } catch (e) {
+      console.error("[main] agent-run:append 失败:", e);
+      return { ok: false, skipped: (e as Error)?.message ?? String(e) };
+    }
+  }
+);
+
+ipcMain.handle(
+  "agent-run:finish",
+  async (_evt, patch: Parameters<ReturnType<typeof createAgentRunsManager>["finish"]>[0]) => {
+    if (!agentRunsManager) return;
+    try {
+      await agentRunsManager.finish(patch);
+    } catch (e) {
+      console.error("[main] agent-run:finish 失败:", e);
+    }
+  }
+);
+
+ipcMain.handle("agent-run:dir", (_evt, runId: string) => agentRunsManager?.dirOf(runId) ?? "");
+
+ipcMain.handle("agent-run:outputs", async (_evt, runId: string) => {
+  if (!agentRunsManager) return [];
+  try {
+    return await agentRunsManager.listOutputs(runId);
+  } catch {
+    return [];
+  }
+});
+
+ipcMain.handle("agent-run:read-outputs", async (_evt, runId: string) => {
+  if (!agentRunsManager) return {};
+  try {
+    return await agentRunsManager.readOutputs(runId);
+  } catch {
+    return {};
+  }
+});
+
+ipcMain.handle("agent-run:save", async (evt, input: ExportInput) => {
+  if (!agentRunsManager) return { ok: false, error: "Manager 未初始化" };
+  // 对话框必须挂到「发起请求的那个窗口」：多窗口下用全局窗口会弹到别人脸上
+  const win = BrowserWindow.fromWebContents(evt.sender);
+  return agentRunsManager.exportRun(input, win && !win.isDestroyed() ? win : null);
 });

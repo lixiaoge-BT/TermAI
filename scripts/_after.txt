@@ -1,0 +1,5 @@
+﻿--- uninstall keys ---
+bd69db83-739b-5d71-9106-02d2d5b11c88 | TermAI 0.1.0 | "D:Traedist-testiprobe3\Uninstall TermAI.exe" /currentuser
+--- recent TermAI.exe (last 20min) ---
+--- installer log dir? ---
+Temp nsis: 7

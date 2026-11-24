@@ -1,0 +1,7 @@
+﻿C:\Users\raotengke\AppData\Local\Programs\TermAI EXISTS items=0
+D:\Trae\dist-test\iprobe3 MISSING
+D:\dist-test\iprobe3 MISSING
+D:Traedist-testinstallprobe2 MISSING
+--- reg ---
+UninstallString="D:Traedist-testiprobe3\Uninstall TermAI.exe" /currentuser
+InstallLocation=

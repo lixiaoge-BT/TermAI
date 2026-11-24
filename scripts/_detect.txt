@@ -1,0 +1,8 @@
+﻿s1_oldstyle = [error]
+s2_sysdir = [1]
+s3_quoted = [1]
+s4_tasklist = [0]
+s5_findstr = [1]
+s6_out = [信息: 没有运行的任务匹配指定标准。
+]
+s7_sysdir = [C:\WINDOWS\system32]

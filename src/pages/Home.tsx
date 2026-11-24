@@ -9,6 +9,7 @@ import { AISidebar } from "@/components/AISidebar";
 import { FileManager } from "@/components/FileManager";
 import { ForwardManager } from "@/components/ForwardManager";
 import { SessionPlayer } from "@/components/SessionPlayer";
+import SysMon from "@/components/SysMon";
 import { useTerminalStore } from "@/store/terminal";
 import { useAppConfig } from "@/store/config";
 import { useChatStore, currentChatKey } from "@/store/chat";
@@ -522,8 +523,8 @@ function TermAIMenu({
 }: {
   onNewWindow: () => void;
   onNewTab: () => void;
-  currentTheme: "dark" | "light" | "system";
-  onThemeChange: (theme: "dark" | "light" | "system") => void;
+  currentTheme: "dark" | "light" | "system" | "xshell";
+  onThemeChange: (theme: "dark" | "light" | "system" | "xshell") => void;
   recording: boolean;
   recElapsed: number;
   onToggleRecording: () => void;
@@ -549,6 +550,7 @@ function TermAIMenu({
   const themeItems = [
     { key: "dark", label: "深色模式", icon: Moon },
     { key: "light", label: "浅色模式", icon: Sun },
+    { key: "xshell", label: "Xshell 绿（纯黑底）", icon: TermIcon },
     { key: "system", label: "跟随系统", icon: Monitor },
   ] as const;
 
@@ -694,7 +696,7 @@ function StatusBar({
     <div
       className="h-6 border-t border-border-primary bg-bg-tertiary text-text-secondary flex items-center px-3 gap-4 text-[10px] flex-shrink-0 overflow-hidden"
     >
-      <span className="flex items-center gap-1.5">
+      <span className="flex items-center gap-1.5 shrink-0 whitespace-nowrap">
         <span
           className={`w-1.5 h-1.5 rounded-full ${
             session?.status === "connected" ? "bg-success-text"
@@ -704,10 +706,17 @@ function StatusBar({
         />
         {session?.status === "connected" ? "已连接" : session?.status === "connecting" ? "连接中..." : "未连接"}
       </span>
-      <span className="truncate">主机: {session?.host ?? "-"}</span>
-      <span className="truncate">用户: {session?.username ?? "-"}</span>
+      {/* min-w-0 + truncate：窗口窄时先牺牲主机名，别让整行文字换行把 24px 的栏撑破 */}
+      <span className="truncate min-w-0">主机: {session?.host ?? "-"}</span>
+      <span className="truncate min-w-0">用户: {session?.username ?? "-"}</span>
       {session?.startTime && (
-        <span className="truncate">连接时长: {formatDurationMs(Date.now() - session.startTime)}</span>
+        <span className="truncate min-w-0">连接时长: {formatDurationMs(Date.now() - session.startTime)}</span>
+      )}
+      {/* 资源监控只对 SSH 会话有意义（本机会话不经过 ssh 通道） */}
+      {/* 直接作为状态栏的 flex 子项：外包一层 span 会多出一个可收缩盒子，
+          导致按钮溢出自身容器、与右侧统计文字重叠 */}
+      {session?.hostId && session.status === "connected" && (
+        <SysMon sessionId={session.id} />
       )}
       {session?.status === "error" && session.errorMsg && (
         <span className="truncate text-danger-text">错误: {session.errorMsg}</span>

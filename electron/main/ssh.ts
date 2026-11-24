@@ -75,9 +75,26 @@ export interface SshForwardStatus {
   error?: string;
 }
 
+/** 独立 exec 通道的执行结果（不含 PTY 回显，纯 stdout/stderr） */
+export interface SshExecResult {
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  /** 超时被中断（此时 stdout 可能是半截） */
+  timeout?: boolean;
+}
+
 export interface SshManager extends SftpManager {
   connect: (sessionId: string, params: SshConnectParams) => Promise<boolean>;
   disconnect: (sessionId: string) => boolean;
+  /**
+   * 在既有连接上另开一条 exec 通道跑命令。
+   *
+   * 为什么不复用用户 PTY：终端里写命令会把回显和提示符留给用户看，
+   * 采样（每 2s 一次）会把界面刷满；exec 通道不占 PTY、不进终端缓冲区，
+   * 也不会打断用户正在敲的输入。
+   */
+  exec: (sessionId: string, command: string, timeoutMs?: number) => Promise<SshExecResult>;
   write: (sessionId: string, data: string) => boolean;
   resize: (sessionId: string, cols: number, rows: number) => boolean;
   listSessions: () => SshSessionInfo[];
@@ -509,6 +526,66 @@ export function createSshManager(win: BrowserWindow): SshManager {
   const listSessions = (): SshSessionInfo[] => {
     return Array.from(sessions.values()).map((s) => ({ ...s.info }));
   };
+
+  // 与用户 PTY 完全隔离的一次性执行通道。只读采样专用：
+  // 不写终端缓冲区、不改 shell 状态、不影响正在输入的半行命令。
+  const exec = (
+    sessionId: string,
+    command: string,
+    timeoutMs = 4000
+  ): Promise<SshExecResult> =>
+    new Promise((resolve, reject) => {
+      const session = sessions.get(sessionId);
+      if (!session) {
+        reject(new Error("SSH 会话不存在"));
+        return;
+      }
+      // 采样是「锦上添花」：连接正在重连/已断开时不要抛给调用方去弹错误框，
+      // 直接给空结果，UI 自己会降级成「—」。
+      if (!session.info.connected) {
+        resolve({ stdout: "", stderr: "not connected", code: null });
+        return;
+      }
+
+      let settled = false;
+      let stdout = "";
+      let stderr = "";
+      const finish = (r: SshExecResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(r);
+      };
+      // 通道卡住（对端不响应）时不能让 Promise 永远挂着，否则采样队列会堆积。
+      const timer = setTimeout(() => {
+        finish({ stdout, stderr, code: null, timeout: true });
+      }, Math.max(500, timeoutMs));
+
+      session.client.exec(command, { pty: false }, (err, stream) => {
+        if (err) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+          return;
+        }
+        // 上限保护：采样命令输出只有几 KB，异常时（比如 /proc 被挂成目录树）
+        // 也不能把主进程内存吃掉。
+        const MAX_OUT = 128 * 1024;
+        stream.on("data", (d: Buffer) => {
+          if (stdout.length < MAX_OUT) stdout += d.toString("utf-8");
+        });
+        stream.stderr.on("data", (d: Buffer) => {
+          if (stderr.length < 8192) stderr += d.toString("utf-8");
+        });
+        stream.on("close", (code: number | null) => {
+          finish({ stdout, stderr, code: code ?? null });
+        });
+        stream.on("error", () => {
+          finish({ stdout, stderr, code: null });
+        });
+      });
+    });
 
   const disposeAll = () => {
     for (const session of sessions.values()) {
@@ -1027,6 +1104,7 @@ export function createSshManager(win: BrowserWindow): SshManager {
     disconnect,
     write,
     resize,
+    exec,
     listSessions,
     disposeAll,
     forwardLocal,

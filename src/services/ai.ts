@@ -47,16 +47,37 @@ const EMPTY_RESPONSE_MESSAGE =
   "② 服务端瞬时异常或限流。请确认模型支持 chat/completion 后重试。";
 
 /**
- * 思考型模型自动关闭思考（Agent 场景专用）。
+ * 这一版网关是否接受 `enable_thinking` 字段。
  *
- * Qwen3 系（含 Qwen3.5）默认开启 thinking：每轮先输出一大段思考，既直接
- * 烧 token，又可能把 max_tokens 吃光导致正文全空。Agent 要的是「立刻按协议
- * 吐命令」，思考纯属浪费，因此显式关闭。
- * 只对确认支持该字段的模型族注入；网关若不认（返回 400/422），requestChat
- * 会自动去掉它重试，不会把原来能跑的请求搞挂。
+ * 一旦被 400/422 拒绝就**永久关掉**：原实现每个请求都先发一次带该字段的请求、
+ * 被拒后再去掉重发 —— 每一轮都白付一次往返（体感就是「模型总是慢一拍」）。
+ * 探测代价只允许付一次，和 stream_options 的处理保持一致。
+ */
+let thinkingFieldUsable = true;
+
+/** 仅供测试：重置网关能力探测状态 */
+export function __resetThinkingFieldSupportForTest(): void {
+  thinkingFieldUsable = true;
+}
+
+/** 原生 OpenAI 模型没有这个字段，发了必 400，直接跳过（含 openai/gpt-4o 这种带厂牌前缀的写法） */
+const OPENAI_NATIVE_MODEL_RE = /^(?:[\w.-]+\/)?(?:gpt-|o\d)/i;
+
+/**
+ * Agent 场景统一关掉思考（Qwen3 / GLM / Kimi / vLLM / ollama / 各类中转）。
+ *
+ * 思考型模型每轮先输出上千 token 推理：既直接烧钱，又会让首字延迟从几秒涨到几十秒
+ * （实测 30~60s 的空等），还很容易把 max_tokens 吃光导致正文为空 → 触发「加大预算
+ * 整轮重生成」，一次往返变两次。这三件事叠起来就是用户看到的「63s 没反应」。
+ *
+ * 只对可能支持该字段的模型注入；网关不认时由 requestChat 去掉并记下（见 droppedExtraBody）。
  */
 export function thinkingDisableExtra(model: string): Record<string, unknown> | undefined {
-  return /\bqwen3(\.\d+)?\b/i.test(model) ? { enable_thinking: false } : undefined;
+  if (!thinkingFieldUsable) return undefined;
+  const name = (model ?? "").trim();
+  if (!name) return undefined;
+  if (OPENAI_NATIVE_MODEL_RE.test(name)) return undefined;
+  return { enable_thinking: false };
 }
 
 /** 一次请求的元信息：用于感知输出被 max_tokens 截断、并采集 token 用量 */
@@ -304,12 +325,20 @@ async function attemptChat(
         truncated: finishReason === "length",
         usage: pickUsage(data?.usage),
       });
+      // 截断自愈（核心修复）：finish_reason === "length" 表示模型被 max_tokens 切断，
+      // 正文哪怕非空也只是一半（常见残片如 `<<<RUN>>>` 写到一半）。此前只在「正文完全为空」
+      // 才抛 OutputBudgetError，导致这种截断回复被当成功返回 → 上层 maxTokens 永远停在 4096，
+      // 每轮都被同样截断、还被误判成「模型不守协议」。这里统一抛错，让 requestChat 自动放大
+      // 预算（×4 且 ≥8192）并关思考后重试（见 requestChat）。
+      if (finishReason === "length") {
+        throw new OutputBudgetError(finishReason);
+      }
       if (!content.trim()) {
         // 空正文分两种，处置完全不同（此前一律怪「模型名配错」，把
         // 「思考吃光预算」也误判成配错模型，误导排查方向）：
-        // ① 有思考痕迹 / 被 length 截断 → 预算不足，换个参数重试能救；
+        // ① 有思考痕迹 → 预算不足，换个参数重试能救；
         // ② 连思考都没有 → 多半真是模型不支持对话，重试无意义，首轮即停。
-        if (finishReason === "length" || reasoning.trim()) {
+        if (reasoning.trim()) {
           throw new OutputBudgetError(finishReason);
         }
         throw new Error(EMPTY_RESPONSE_MESSAGE);
@@ -371,6 +400,12 @@ async function attemptChat(
       usage,
     });
 
+    // 截断自愈（流式同非流式）：finish_reason === "length" 表示被 max_tokens 切断，
+    // 正文非空也只是半截，同样抛错触发预算扩容重试。
+    if (finishReason === "length") {
+      throw new OutputBudgetError(finishReason);
+    }
+
     // 一个正文 token 都没收到，分两种情况：
     // ① 有思考输出 → 预算被思考吃光，退回非流式也是白搭，按预算不足处理
     //    （上层会关掉思考 + 加大 max_tokens 再试）；
@@ -418,6 +453,15 @@ async function requestChat(
     }
     // 本次尝试是否携带 stream_options（流式且该能力尚未被网关拒过）
     const withStreamUsage = useStream && streamUsageEnabled;
+    // 网关已明确拒绝过 enable_thinking：这条请求起就不再带它。
+    // 必要性：调用方（Agent）在 run 开始时就把 extraBody 烘进了 config，
+    // 只清本地 cfg 的话，这一轮的**后续每一次**请求都会重新带上字段、再吃一次 400 ——
+    // 也就是「每轮都慢一拍」的根因。所以在这里按模块级探测结果统一剥掉。
+    if (!thinkingFieldUsable && cfg.extraBody?.enable_thinking !== undefined) {
+      const rest = { ...cfg.extraBody };
+      delete rest.enable_thinking;
+      cfg = { ...cfg, extraBody: Object.keys(rest).length > 0 ? rest : undefined };
+    }
     try {
       return await attemptChat(
         cfg,
@@ -447,9 +491,13 @@ async function requestChat(
       }
       // 多塞的 extraBody 字段被网关拒绝（400/422）：去掉它重试，保证
       // 「自动关思考」这个优化永远不会把原本能跑的请求搞挂。
+      // 500 也纳入：部分自建网关对未知字段不是回 400 而是直接 500。
       const status = (e as { status?: number })?.status;
-      if (cfg.extraBody && !droppedExtraBody && (status === 400 || status === 422)) {
+      if (cfg.extraBody && !droppedExtraBody && (status === 400 || status === 422 || status === 500)) {
         droppedExtraBody = true;
+        // 我们注入的「关思考」字段被拒 → 记下来，后续请求不再发。
+        // 否则每一轮都会先付一次 400 + 重试，正是「模型总是慢一拍」的来源之一。
+        if (cfg.extraBody.enable_thinking !== undefined) thinkingFieldUsable = false;
         cfg = { ...cfg, extraBody: undefined };
         continue;
       }

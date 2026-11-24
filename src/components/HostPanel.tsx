@@ -319,10 +319,10 @@ export function HostPanel({ open, onToggle, onQuickConnect }: Props) {
           return (
             <div key={g.name || "__ungrouped__"}>
               <div
-                className={`flex items-center gap-1.5 px-2 py-1.5 border-b border-border-primary cursor-pointer select-none sticky top-0 z-10 transition-colors ${
+                className={`flex items-center gap-1.5 px-2 py-1.5 border-b border-border-secondary cursor-pointer select-none sticky top-0 z-10 transition-colors ${
                   dragOverGroup === g.name
                     ? "bg-accent-20 border-accent"
-                    : "bg-bg-tertiary border-border-primary"
+                    : "bg-bg-tertiary border-border-secondary"
                 }`}
                 onClick={() => toggleCollapse(g.name)}
                 onDragOver={(e) => {

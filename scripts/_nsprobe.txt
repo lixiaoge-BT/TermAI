@@ -1,0 +1,4 @@
+﻿s0=entered
+s1=call-nsprocess-returned-
+s2=kernel32-ok-
+s3=nsexec-ok-error

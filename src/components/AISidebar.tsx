@@ -31,6 +31,7 @@ import { AgentPanel, type AgentSessionLite } from "./AgentPanel";
 import { useShallow } from "zustand/react/shallow";
 import type { ParsedCommand } from "@/types";
 import { parseCommandsFromMarkdown } from "@/services/safety";
+import { isAutoFocusSuppressed } from "@/lib/uiFocus";
 
 type AIMode = "chat" | "agent";
 
@@ -214,7 +215,9 @@ function SettingsButton() {
   }, [aiConfig, open]);
 
   const save = () => {
-    updateAI(form);
+    // 只保留「自定义」供应商；旧配置里的 openai 在首次保存时归一化为 custom
+    // （底层 custom/openai 走同一请求路径，行为不变）
+    updateAI({ ...form, provider: "custom" });
     setOpen(false);
   };
 
@@ -243,20 +246,12 @@ function SettingsButton() {
             <div className="p-4 space-y-3 overflow-y-auto flex-1 min-h-0">
               <Field label="API 供应商">
                 <div className="flex gap-2">
-                  {(["openai", "custom"] as const).map((p) => (
-                    <button
-                      key={p}
-                      type="button"
-                      onClick={() => setForm({ ...form, provider: p })}
-                      className={`flex-1 text-xs py-2 rounded border ${
-                        form.provider === p
-                          ? "bg-accent-20 border-accent text-accent-text"
-                          : "bg-bg-secondary border-border-primary text-text-secondary"
-                      }`}
-                    >
-                      {p === "openai" ? "OpenAI 兼容" : "自定义"}
-                    </button>
-                  ))}
+                  <button
+                    type="button"
+                    className="flex-1 text-xs py-2 rounded border bg-accent-20 border-accent text-accent-text"
+                  >
+                    自定义
+                  </button>
                 </div>
               </Field>
               <Field label="API Base URL">
@@ -405,9 +400,13 @@ function ChatArea({
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
-  // 终端里输入 `?问题` 唤起 AI 时，把焦点交到输入框，用户能直接接着打字/补充
+  // 终端里输入 `?问题` 唤起 AI 时，把焦点交到输入框，用户能直接接着打字/补充。
+  // 但「自动分析」是后台行为：它同样派发 termai:quick-ask，如果在用户敲命令的
+  // 瞬间把焦点抢走，接着敲的字母进不了终端、空格打进这里、退格改错的也是这里 ——
+  // 用户看到的就是「终端偶发打不进字」。发起方会用 suppressAutoFocus 声明意图。
   useEffect(() => {
     const handler = () => {
+      if (isAutoFocusSuppressed()) return;
       textareaRef.current?.focus();
     };
     window.addEventListener("termai:quick-ask", handler);

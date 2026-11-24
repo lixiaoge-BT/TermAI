@@ -1,0 +1,4 @@
+﻿AppPath=C:\Users\raotengke\AppData\Local\Programs\TermAI\TermAI.exe
+--- desktop/startmenu shortcuts ---
+C:\Users\raotengke\Desktop\TermAI.lnk  11/06/2026 18:24:26
+C:\Users\raotengke\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\TermAI.lnk  11/06/2026 18:24:26

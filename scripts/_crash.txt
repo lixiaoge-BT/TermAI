@@ -1,0 +1,156 @@
+﻿==== 2026-11-06 17:37:49 | Windows Error Reporting | ID=1001
+故障存储段 1368195272719589460，类型 1
+事件名称: APPCRASH
+响应: 不可用
+Cab ID: 0
+
+问题签名:
+P1: TermAI Setup 0.1.0.exe
+P2: 0.1.0.0
+P3: 5c157f86
+P4: System.dll
+P5: 0.0.0.0
+P6: 5c157efa
+P7: c0000005
+P8: 00001581
+P9: 
+P10: 
+
+附加文件:
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.d2690d2c-0094-45db-9665-3b95f8af6826.tmp.mdmp
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.4a8da9fd-f2c4-41dd-9990-a40547e0d992.tmp.WERInternalMetadata.xml
+WPR_initiated_DiagTrackMiniLogger_OneTrace_User_Logger_20261105_1_EC_0_inject.etl
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.f4195918-b7fd-4181-b022-6aeea1e93a5a.tmp.etl
+WPR_initiated_DiagTrackMiniLogger_WPR System Collector_inject.etl
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.0a0927a8-fa51-4f6b-96d8-747eaa10b6eb.tmp.etl
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.7d02e32c-639f-4ebd-a6f8-34936d56d124.tmp.csv
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.3bb578e1-5877-4724-811b-84abba8c735a.tmp.txt
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.9d0925f1-178c-4caf-8711-ffe340f23456.tmp.xml
+
+可在此处获取这些文件:
+\\?\C:\ProgramData\Microsoft\Windows\WER\ReportArchive\AppCrash_TermAI Setup 0.1_7d5e13e5a9d0454860ae56983f7c7ed6d15651a_aa3293c0_c87fc9aa-87ca-4669-a7a6-26af9a28568c
+
+分析符号: 
+重新检查解决方案: 0
+报告 ID: 91fcd469-1e6f-42f0-af1c-f7d7991a1709
+报告状态: 268435456
+哈希存储段: 491f1cd1fb218675e2fcce59fdd1e054
+Cab GUID: 0
+
+==== 2026-11-06 17:37:45 | Application Error | ID=1000
+出错应用程序名称： TermAI Setup 0.1.0.exe，版本： 0.1.0.0，时间戳： 0x5c157f86
+出错模块名称： System.dll， 版本： 0.0.0.0，时间戳： 0x5c157efa
+异常代码： 0xc0000005
+错误偏移： 0x00001581
+出错进程 ID： 0xF9E4
+出错应用程序开始时间： 0x1DD6DD27911B9DD
+Faulting 应用程序路径： D:\Trae\release\dl-20261106e\TermAI Setup 0.1.0.exe
+Faulting 模块路径： C:\Users\RAOTEN~1\AppData\Local\Temp\nsc648D.tmp\System.dll
+Report ID： 91fcd469-1e6f-42f0-af1c-f7d7991a1709
+Faulting 包全名： 
+Faulting 程序包相对应用程序 ID：  个
+
+==== 2026-11-04 13:07:43 | Windows Error Reporting | ID=1001
+故障存储段 1368195272719589460，类型 1
+事件名称: APPCRASH
+响应: 不可用
+Cab ID: 0
+
+问题签名:
+P1: TermAI Setup 0.1.0.exe
+P2: 0.1.0.0
+P3: 5c157f86
+P4: System.dll
+P5: 0.0.0.0
+P6: 5c157efa
+P7: c0000005
+P8: 00001581
+P9: 
+P10: 
+
+附加文件:
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.14e465b6-c65b-42d9-8ea4-1a2d68ae1144.tmp.mdmp
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.eb93d3d5-50d3-4903-8a1b-f1075209024b.tmp.WERInternalMetadata.xml
+WPR_initiated_DiagTrackMiniLogger_OneTrace_User_Logger_20261016_1_EC_0_inject.etl
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.d4a357f5-7de3-4df2-8b6d-c1c43032c2f4.tmp.etl
+WPR_initiated_DiagTrackMiniLogger_WPR System Collector_inject.etl
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.2981953b-d379-40be-b886-053e13b08764.tmp.etl
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.6c6aa1d9-3708-4546-b530-82ec57438222.tmp.csv
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.a956594f-af6c-4d2b-a922-7a052c27a152.tmp.txt
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.5cfc6e0c-010f-4841-b0f0-40a84cbb3474.tmp.xml
+
+可在此处获取这些文件:
+\\?\C:\ProgramData\Microsoft\Windows\WER\ReportArchive\AppCrash_TermAI Setup 0.1_7d5e13e5a9d0454860ae56983f7c7ed6d15651a_aa3293c0_ddeb868e-87b2-4479-b51e-28443f79adcc
+
+分析符号: 
+重新检查解决方案: 0
+报告 ID: db04f78f-4044-4c75-92af-a08499a7f20e
+报告状态: 268435456
+哈希存储段: 491f1cd1fb218675e2fcce59fdd1e054
+Cab GUID: 0
+
+==== 2026-11-04 13:07:40 | Application Error | ID=1000
+出错应用程序名称： TermAI Setup 0.1.0.exe，版本： 0.1.0.0，时间戳： 0x5c157f86
+出错模块名称： System.dll， 版本： 0.0.0.0，时间戳： 0x5c157efa
+异常代码： 0xc0000005
+错误偏移： 0x00001581
+出错进程 ID： 0x151CC
+出错应用程序开始时间： 0x1DD6C1A69A19AD5
+Faulting 应用程序路径： D:\Trae\release\dl-20261104b\TermAI Setup 0.1.0.exe
+Faulting 模块路径： C:\Users\RAOTEN~1\AppData\Local\Temp\nsl5786.tmp\System.dll
+Report ID： db04f78f-4044-4c75-92af-a08499a7f20e
+Faulting 包全名： 
+Faulting 程序包相对应用程序 ID：  个
+
+==== 2026-11-02 16:55:11 | Windows Error Reporting | ID=1001
+故障存储段 1368195272719589460，类型 1
+事件名称: APPCRASH
+响应: 不可用
+Cab ID: 0
+
+问题签名:
+P1: TermAI Setup 0.1.0.exe
+P2: 0.1.0.0
+P3: 5c157f86
+P4: System.dll
+P5: 0.0.0.0
+P6: 5c157efa
+P7: c0000005
+P8: 00001581
+P9: 
+P10: 
+
+附加文件:
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.fe4ea2b7-3173-48c8-962a-a6f718374439.tmp.mdmp
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.aa1f40c6-4d63-4ca0-93ba-165813573517.tmp.WERInternalMetadata.xml
+WPR_initiated_DiagTrackMiniLogger_OneTrace_User_Logger_20261016_1_EC_0_inject.etl
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.7f2c0f5e-7cdc-4866-9c29-8abc08500c77.tmp.etl
+WPR_initiated_DiagTrackMiniLogger_WPR System Collector_inject.etl
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.68e21e1c-0192-4106-8aa8-c88952f69fd6.tmp.etl
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.10dd4cff-0c96-44a6-a3fb-095e08dbf0a2.tmp.csv
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.a952253f-fe16-48dd-a196-3fa910785eac.tmp.txt
+\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.83037626-0321-4359-bab0-3fa63e1096dc.tmp.xml
+
+可在此处获取这些文件:
+\\?\C:\ProgramData\Microsoft\Windows\WER\ReportArchive\AppCrash_TermAI Setup 0.1_7d5e13e5a9d0454860ae56983f7c7ed6d15651a_aa3293c0_b253823f-ec32-4f69-a75f-3a488e566a1b
+
+分析符号: 
+重新检查解决方案: 0
+报告 ID: 595a8ba7-8136-406b-a5a9-f2f074b60f88
+报告状态: 268435456
+哈希存储段: 491f1cd1fb218675e2fcce59fdd1e054
+Cab GUID: 0
+
+==== 2026-11-02 16:55:08 | Application Error | ID=1000
+出错应用程序名称： TermAI Setup 0.1.0.exe，版本： 0.1.0.0，时间戳： 0x5c157f86
+出错模块名称： System.dll， 版本： 0.0.0.0，时间戳： 0x5c157efa
+异常代码： 0xc0000005
+错误偏移： 0x00001581
+出错进程 ID： 0xA0BC
+出错应用程序开始时间： 0x1DD6AA7DC14FE1A
+Faulting 应用程序路径： D:\Trae\release\dl-20261102b\TermAI Setup 0.1.0.exe
+Faulting 模块路径： C:\Users\RAOTEN~1\AppData\Local\Temp\nszB2C2.tmp\System.dll
+Report ID： 595a8ba7-8136-406b-a5a9-f2f074b60f88
+Faulting 包全名： 
+Faulting 程序包相对应用程序 ID：  个
+

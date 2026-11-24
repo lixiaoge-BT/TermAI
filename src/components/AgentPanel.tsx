@@ -23,11 +23,14 @@ import {
   TerminalSquare,
   ClipboardList,
   Layers,
+  Download,
 } from "lucide-react";
 import type { RiskLevel } from "@/services/safety";
-import { useSessionAgent, type AgentStep } from "@/store/agent";
+import { useSessionAgent, useSessionLiveThought, type AgentStep } from "@/store/agent";
 import { useAppConfig } from "@/store/config";
 import { renderMarkdownToHtml } from "@/lib/markdown";
+import { busyHint } from "@/lib/busyHint";
+import { exportAgentRun, type ExportRunInput } from "@/lib/exportRun";
 
 const RISK_META: Record<
   RiskLevel,
@@ -77,6 +80,27 @@ function formatTokens(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
+/**
+ * 忙碌计时：spinner 只说明「在转」，说明不了「卡住了没有」。
+ * `resetKey` 变化即清零 —— 现在传的是 `stageSince`（阶段开始时间），
+ * 所以数字永远对得上「当前这一阶段等了多久」，不会把执行/压缩/重连算成模型慢。
+ * 传入 `since` 时按其绝对时间算起：面板切回来（重新挂载）也能看到真实已等时长。
+ */
+function useBusySeconds(active: boolean, resetKey: unknown, since?: number): number {
+  const [sec, setSec] = useState(0);
+  useEffect(() => {
+    if (!active) {
+      setSec(0);
+      return;
+    }
+    const t0 = since ?? Date.now();
+    setSec(Math.max(0, Math.floor((Date.now() - t0) / 1000)));
+    const id = setInterval(() => setSec(Math.floor((Date.now() - t0) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [active, resetKey, since]);
+  return sec;
+}
+
 export function AgentPanel({
   session,
   hostConfig: _hostConfig,
@@ -95,9 +119,12 @@ export function AgentPanel({
     error,
     autoRunMedium,
     pendingConfirm,
-    liveThought,
     plan,
     metrics,
+    runId,
+    startedAt,
+    stage,
+    stageSince,
     setGoal,
     setAutoRunMedium,
     run,
@@ -109,7 +136,53 @@ export function AgentPanel({
 
   const stepsEndRef = useRef<HTMLDivElement>(null);
   const busy = phase === "running" || phase === "awaiting-confirm";
+  // 计时锚点用「阶段开始时间」：每轮模型调用、每次执行/压缩/重连都会刷新它，
+  // 没有时（刚启动）退回步骤数。数字与标签必须能互相解释，否则就是误报。
+  const waitedSec = useBusySeconds(busy, stageSince ?? steps.length, stageSince);
+  const busyInfo = busyHint(stage, phase, waitedSec);
   const phaseMeta = PHASE_META[phase] ?? PHASE_META.idle;
+
+  // 导出：默认落到用户选的目录，成功后把路径显示出来（否则用户不知道文件去哪了）
+  const [exporting, setExporting] = useState(false);
+  const [exportNote, setExportNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const canExport = steps.length > 0 || !!summary;
+
+  const doExport = async () => {
+    if (!canExport || exporting) return;
+    setExporting(true);
+    setExportNote(null);
+    try {
+      const input: ExportRunInput = {
+        goal: submittedGoal || goal,
+        plan,
+        summary,
+        // AgentStep 与 ExportableStep 字段一致，这里只做类型收窄
+        steps,
+        host: session?.host,
+        hostName: session?.hostName,
+        user: session?.username,
+        startedAt,
+        finishedAt: Date.now(),
+        metricsLine:
+          metrics.llmCalls > 0
+            ? `LLM ${metrics.llmCalls} 次 / ${(metrics.llmMs / 1000).toFixed(1)}s`
+            : "",
+        runId,
+      };
+      const res = await exportAgentRun(input);
+      if (res.canceled) return;
+      if (!res.ok) {
+        setExportNote({ ok: false, text: `导出失败：${res.error ?? "未知错误"}` });
+        return;
+      }
+      setExportNote({
+        ok: true,
+        text: `已导出到 ${res.dir}（report.html / report.md / report.docx）`,
+      });
+    } finally {
+      setExporting(false);
+    }
+  };
 
   // 新步骤产生时自动滚动到底部
   useEffect(() => {
@@ -166,13 +239,25 @@ export function AgentPanel({
           <StepCard key={step.id} step={step} />
         ))}
 
-        {/* AI 正在生成时实时展示流式文本（模型返回完整结果前） */}
-        {liveThought && <LiveThoughtCard text={liveThought} />}
+        {/* AI 正在生成时实时展示流式文本（模型返回完整结果前）。
+            单独订阅 liveThought：它 60ms 刷一次，留在面板主 selector 里
+            会让整个步骤列表跟着流式输出重渲染。 */}
+        <LiveThoughtCard sessionId={session?.id ?? null} />
 
         {busy && (
           <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-bg-tertiary border border-border-primary text-xs text-text-secondary">
-            <Loader2 size={13} className="animate-spin text-text-link" />
-            {phase === "awaiting-confirm" ? "等待你确认下一条命令..." : "AI 正在分析并执行..."}
+            <Loader2 size={13} className="animate-spin text-text-link shrink-0" />
+            <span className="truncate min-w-0">{busyInfo.label}</span>
+            {waitedSec >= 3 && (
+              <span
+                className={`ml-auto whitespace-nowrap tabular-nums ${
+                  busyInfo.warn ? "text-warning-text" : "text-text-tertiary"
+                }`}
+                title="当前阶段已等待时长（切换阶段或进入新一轮时重新计时）"
+              >
+                {waitedSec}s{busyInfo.hint}
+              </span>
+            )}
           </div>
         )}
 
@@ -188,7 +273,7 @@ export function AgentPanel({
           />
         )}
 
-        {summary && <SummaryCard summary={summary} />}
+        {summary && <SummaryCard summary={summary} stale={busy} onExport={doExport} exporting={exporting} />}
         <div ref={stepsEndRef} />
       </div>
 
@@ -237,6 +322,18 @@ export function AgentPanel({
         </span>
       </div>
 
+      {/* 导出结果提示：成功时带完整路径，用户才知道文件去哪了 */}
+      {exportNote && (
+        <div
+          className={`px-3 pb-1 text-[10px] truncate flex-shrink-0 ${
+            exportNote.ok ? "text-text-tertiary" : "text-danger-text"
+          }`}
+          title={exportNote.text}
+        >
+          {exportNote.text}
+        </div>
+      )}
+
       {/* 目标输入 */}
       <div className="border-t border-border-primary p-2 flex-shrink-0">
         <div className="bg-bg-tertiary border border-border-primary focus-within:border-accent rounded-lg overflow-hidden">
@@ -266,6 +363,14 @@ export function AgentPanel({
                 title="清空任务记录"
               >
                 <Trash2 size={14} />
+              </button>
+              <button
+                onClick={() => void doExport()}
+                disabled={!canExport || exporting}
+                className="p-1 text-text-secondary hover:text-accent-text rounded hover:bg-bg-hover disabled:opacity-40 disabled:cursor-not-allowed"
+                title="导出报告（HTML / Markdown / Word 三种格式，含完整输出）"
+              >
+                {exporting ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
               </button>
               <span className="text-[10px] text-text-secondary inline-flex items-center gap-1">
                 <TerminalSquare size={11} />
@@ -487,7 +592,9 @@ function ConfirmCard({
         </span>
       </div>
       <div className="px-3 py-2">
-        <pre className="font-mono text-[11px] text-text-primary whitespace-pre-wrap break-all bg-bg-secondary border border-border-primary rounded p-2">
+        {/* heredoc 写服务单元这类命令会很长：必须限高 + 可滚动，
+            否则确认卡把整个面板撑满，用户反而看不到「确认」按钮。 */}
+        <pre className="font-mono text-[11px] text-text-primary whitespace-pre-wrap break-all bg-bg-secondary border border-border-primary rounded p-2 max-h-52 overflow-auto">
           {command}
         </pre>
         <div className="mt-2 text-[11px] text-text-secondary">{riskDescription}</div>
@@ -502,22 +609,27 @@ function ConfirmCard({
           </ul>
         )}
       </div>
-      <div className="flex justify-end gap-2 px-3 py-2 border-t border-danger/30">
+      <div className="flex justify-end items-center gap-2 px-3 py-2 border-t border-danger/30">
+        {/* 明确告知会自动超时：否则用户以为可以无限挂着，回来发现任务已被终止。 */}
+        <span className="mr-auto min-w-0 text-[10px] text-text-tertiary leading-snug">
+          10 分钟内未确认将自动终止（避免无人值守时执行高危命令）
+        </span>
+        {/* 按钮必须 shrink-0 + nowrap：窄面板下否则「确认执行」会被压成两行 */}
         <button
           onClick={onAbort}
-          className="px-2.5 py-1 text-[11px] rounded border border-border-primary hover:bg-bg-hover text-text-secondary"
+          className="shrink-0 whitespace-nowrap px-2.5 py-1 text-[11px] rounded border border-border-primary hover:bg-bg-hover text-text-secondary"
         >
           终止任务
         </button>
         <button
           onClick={onSkip}
-          className="px-2.5 py-1 text-[11px] rounded border border-border-primary hover:bg-bg-hover text-text-secondary"
+          className="shrink-0 whitespace-nowrap px-2.5 py-1 text-[11px] rounded border border-border-primary hover:bg-bg-hover text-text-secondary"
         >
           跳过这步
         </button>
         <button
           onClick={onRun}
-          className="px-2.5 py-1 text-[11px] rounded bg-danger hover:bg-danger-hover text-white font-medium"
+          className="shrink-0 whitespace-nowrap px-2.5 py-1 text-[11px] rounded bg-danger hover:bg-danger-hover text-white font-medium"
         >
           确认执行
         </button>
@@ -543,7 +655,17 @@ function PlanCard({ plan }: { plan: string }) {
   );
 }
 
-function SummaryCard({ summary }: { summary: string }) {
+function SummaryCard({
+  summary,
+  stale,
+  onExport,
+  exporting,
+}: {
+  summary: string;
+  stale?: boolean;
+  onExport?: () => void;
+  exporting?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
   // 总结内容不随渲染变化，缓存 markdown 解析结果，避免每次父组件重渲染都重算
   const html = useMemo(() => renderMarkdownToHtml(summary), [summary]);
@@ -564,14 +686,32 @@ function SummaryCard({ summary }: { summary: string }) {
         <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-text-primary">
           <CheckCircle2 size={13} className="text-success-text" />
           任务总结
+          {stale && (
+            <span className="text-[10px] font-normal text-text-tertiary">
+              （上一轮的结论，新一轮仍在执行）
+            </span>
+          )}
         </span>
-        <button
-          onClick={copy}
-          className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border border-border-primary hover:bg-bg-hover text-text-secondary"
-        >
-          <Copy size={11} />
-          {copied ? "已复制" : "复制"}
-        </button>
+        <span className="inline-flex items-center gap-1">
+          {onExport && (
+            <button
+              onClick={onExport}
+              disabled={exporting}
+              className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border border-border-primary hover:bg-bg-hover text-text-secondary disabled:opacity-50"
+              title="导出为文件（HTML / Markdown / Word，含完整输出）"
+            >
+              {exporting ? <Loader2 size={11} className="animate-spin" /> : <Download size={11} />}
+              导出
+            </button>
+          )}
+          <button
+            onClick={copy}
+            className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border border-border-primary hover:bg-bg-hover text-text-secondary"
+          >
+            <Copy size={11} />
+            {copied ? "已复制" : "复制"}
+          </button>
+        </span>
       </div>
       <div
         className="p-3 text-xs text-text-primary"
@@ -581,9 +721,11 @@ function SummaryCard({ summary }: { summary: string }) {
   );
 }
 
-function LiveThoughtCard({ text }: { text: string }) {
+function LiveThoughtCard({ sessionId }: { sessionId: string | null }) {
+  const text = useSessionLiveThought(sessionId);
   // 流式文本实时渲染（节流由 store 端控制，这里只负责展示）
-  const html = useMemo(() => renderMarkdownToHtml(text), [text]);
+  const html = useMemo(() => (text ? renderMarkdownToHtml(text) : ""), [text]);
+  if (!text) return null;
   return (
     <div className="rounded-lg border border-accent/30 bg-bg-tertiary overflow-hidden opacity-90">
       <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-border-primary text-[11px] text-text-secondary">

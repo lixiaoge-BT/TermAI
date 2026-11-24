@@ -38,6 +38,7 @@ export default {
         // 边框色
         "border-primary": "var(--border-primary)",
         "border-secondary": "var(--border-secondary)",
+        "border-tertiary": "var(--border-tertiary)",
         // 强调色
         "accent": "var(--accent)",
         "accent-hover": "var(--accent-hover)",

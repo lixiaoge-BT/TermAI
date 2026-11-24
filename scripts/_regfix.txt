@@ -1,0 +1,3 @@
+﻿BEFORE: TermAI 0.1.0 | "D:Traedist-testiprobe3\Uninstall TermAI.exe" /currentuser
+REMOVED
+AFTER exists=False

@@ -31,6 +31,12 @@ export interface CommandReviewResult {
   confirmationItems: string[];
   suggestedAlternative?: string;
   backupSuggestion?: string;
+  /**
+   * 命中受保护路径的写操作：**接管期间直接拒绝执行**，不进确认队列。
+   * 语义与 `requireConfirmation` 不同 —— 后者是「问用户要不要做」，这里是「一律不做」。
+   */
+  blocked?: boolean;
+  blockedReason?: string;
 }
 
 // ==================================================================
@@ -206,6 +212,14 @@ interface Rule {
   description: string;
   confirm?: string[];
   alternative?: string;
+  /**
+   * 即使只判 medium 也必须人工确认。
+   *
+   * 用于「内容不可静态审查」的形态（解释器内联代码 `python -c …`）：风险等级不该
+   * 一律抬到 high（`python3 -c 'print(1)'` 是高频无害用法），但**绝不能静默执行** ——
+   * 那等于让模型绕过所有本地规则。所以级别留 medium，确认强制加上。
+   */
+  forceConfirm?: boolean;
 }
 
 const DANGEROUS_RULES: Rule[] = [
@@ -296,6 +310,34 @@ const DANGEROUS_RULES: Rule[] = [
 
   // ---------------- 高危 ----------------
   {
+    // 反弹 shell / 后门：nc 的 -e 把 stdin/out 接到一个程序上。
+    // 这是最经典的持久化后门手法，必须挡住（`nc -l` 监听本身不算）。
+    pattern: /\b(?:nc|ncat|netcat)\b[^\n]*\s-e\s|\bsocat\b[^\n]*\bEXEC:/i,
+    risk: "high",
+    description: "把网络连接接到本地程序上（反弹 shell / 后门），等于把机器控制权交出去",
+    confirm: ["确认这是授权的安全测试", "确认目标地址可信", "理解该连接可执行任意命令"],
+    alternative: "需要远程执行请用 SSH：`ssh user@host 命令`，不要在主机上留下常驻后门",
+  },
+  {
+    // 内核模块：加载未签名/来路不明的 .ko 可直接 rootkit 化，且 rmmod 也救不回来。
+    pattern: /\b(?:insmod|modprobe|rmmod)\b/,
+    risk: "high",
+    description: "加载/卸载内核模块，可能引入 rootkit 或直接让内核崩溃",
+    confirm: ["确认模块来源可信且已签名", "已确认该内核版本兼容", "已备份重要数据"],
+  },
+  {
+    // 解释器内联代码：内容完全不可静态审查，等价于 `bash -c`。
+    // 旧实现把 `python -c` 直接列进只读子命令白名单 —— 于是
+    // `python -c "import os; os.system('rm -rf /data')"` 被判成 none 并自动执行。
+    pattern: /\b(?:python3?|perl|ruby|node|nodejs|php|lua)\b\s+(?:-\S+\s+)*(?:-c|-e|-r)\b/,
+    risk: "medium",
+    description: "把内联代码直接交给解释器执行，内容无法在本地规则里审查",
+    confirm: ["已阅读即将执行的代码", "确认代码不修改系统文件或删除数据"],
+    alternative: "把代码写成脚本文件再执行：`cat > /tmp/x.py <<'EOF' … EOF && cat /tmp/x.py`，确认内容后再 `python3 /tmp/x.py`",
+    // 内容不可审查 → 必须人看一眼，不能因为「只是 medium」就被 autoRunMedium 放行
+    forceConfirm: true,
+  },
+  {
     pattern: /\b(?:shutdown|reboot|halt|poweroff|init\s+[06]|telinit\s+[06]|systemctl\s+(?:reboot|poweroff|halt))\b/,
     risk: "high",
     description: "系统将关机或重启，正在运行的服务会中断",
@@ -338,6 +380,49 @@ const DANGEROUS_RULES: Rule[] = [
     risk: "high",
     description: "强制推送会覆盖远程分支历史，他人提交可能丢失",
     confirm: ["已确认分支正确", "已通知协作者", "已确认不需要远程上的提交"],
+  },
+  {
+    // 管道把「任意内容」交给 shell 执行。旧规则只认 `curl|wget … | sh`，
+    // 于是 `echo <base64> | base64 -d | bash`、`cat payload | sh` 这类**等价**写法
+    // 被判成 low 并被 Agent 直接执行（探针实测：low / 无需确认）。
+    // 内容不来自网络不代表可信 —— 只是把 RCE 藏得更深。
+    // 判据要求 `sh` 后必须是空白/结束/管道/括号，避免误伤 shasum、shellcheck 等。
+    pattern: /\|\s*(?:sudo\s+)?(?:ba|z|fi|k)?sh(?:\s|$|[|)])/,
+    risk: "high",
+    description: "把管道内容直接交给 shell 执行，内容未经审查，等价于执行任意代码",
+    confirm: ["已确认内容来源可信", "已实际阅读将要执行的脚本", "理解将以当前权限执行任意代码"],
+    alternative: "先落盘并检查：`命令 > /tmp/x.sh && cat /tmp/x.sh`，确认无误后再 `bash /tmp/x.sh`",
+  },
+  {
+    // 特权容器 / 挂载宿主根目录：容器内可随意改写宿主机（容器逃逸的常规手法）。
+    pattern:
+      /\b(?:docker|podman|nerdctl)\b[^\n]*\brun\b[^\n]*(?:--privileged|--pid[= ]host|--net[= ]host|--cap-add\b|-v\s*\/\s*:|--volume\s*\/\s*:|\/var\/run\/docker\.sock)/,
+    risk: "high",
+    description: "以特权方式启动容器（特权模式 / 挂载宿主根目录 / 挂载 docker.sock），容器内可直接控制宿主机",
+    confirm: ["确认该容器来源可信", "理解容器内可改写宿主机文件", "已备份宿主机关键数据"],
+  },
+  {
+    // 追加/覆盖 SSH 公钥列表 = 给某个密钥开免密登录后门（持久化）。
+    pattern: />{1,2}\s*[^\s>]*\.ssh\/authorized_keys\b/,
+    risk: "high",
+    description: "写入 SSH 公钥列表，等于为该密钥开放免密登录（持久化后门）",
+    confirm: ["确认该公钥属于可信对象", "已记录本次追加的密钥内容"],
+    alternative: "需要授权时优先由本人执行 `ssh-copy-id`，或在确认公钥指纹后再追加",
+  },
+  {
+    // 直接覆盖账号/提权相关的系统文件。
+    pattern: />{1,2}\s*[^\s>]*\/etc\/(?:passwd|shadow|gshadow|group|sudoers)(?:\s|$)/,
+    risk: "high",
+    description: "覆盖系统账号/提权配置文件，可能导致无法登录或权限失控",
+    confirm: ["已备份原文件", "确认改动内容正确", "已确认仍有可用的登录方式"],
+    alternative: "改用 `vipw` / `visudo`（带语法校验）而不是直接重定向覆盖",
+  },
+  {
+    // 把日志截断为 0 字节：审计与排障线索不可恢复，且是入侵后常见动作。
+    pattern: /\btruncate\s+-s\s*0\s+\/var\/log\//,
+    risk: "high",
+    description: "把日志文件清零，审计与排障线索将不可恢复",
+    confirm: ["确认是日志轮转的正常操作", "已确认不需要该日志用于排查"],
   },
   {
     pattern: /\bgit\s+clean\s+-[a-zA-Z]*[fd]/,
@@ -502,8 +587,12 @@ const SUBCOMMAND_READONLY: Record<string, RegExp> = {
   nginx: /^(?:-t|-T|-v|-V)$/i,
   npm: /^(?:ls|list|view|info|search|outdated|audit|why|config\s+get)$/i,
   pip: /^(?:list|show|search|freeze|check)$/i,
-  python3: /^(?:-c|-V|--version)$/i,
-  python: /^(?:-c|-V|--version)$/i,
+  // 注意：python/python3 的 `-c` **不能**算只读 —— 它执行任意代码。
+  // 旧实现把它列在这里，导致 `python -c "os.system('rm -rf …')"` 被判 none 自动执行；
+  // 现在由 DANGEROUS_RULES 里的「解释器内联代码」规则抬到 medium。
+  // 这里只保留真正无副作用的版本探测。
+  python3: /^(?:-V|--version)$/i,
+  python: /^(?:-V|--version)$/i,
 };
 
 /**
@@ -652,6 +741,234 @@ interface SegmentVerdict {
   description: string;
   confirm: string[];
   alternative?: string;
+  forceConfirm?: boolean;
+}
+
+// ==================================================================
+// 受保护路径：接管期间「只读可以，写入一律不做」
+// ------------------------------------------------------------------
+// 用户明确要求：敏感路径默认不做任何操作。这类文件一旦被改，后果是
+// 「再也登不进机器」或「权限静默失控」，而 Agent 事后无法判断自己改得对不对。
+// 所以不是「弹确认让用户点」，而是**直接拒绝**，并要求写进总结由人工执行。
+// ==================================================================
+
+/** 去掉引号、把 ~ 展开成 /root，便于统一匹配 */
+function normalizePath(p: string): string {
+  const s = stripQuotes((p ?? "").trim());
+  if (!s) return "";
+  return s.replace(/^~(?=\/|$)/, "/root");
+}
+
+/**
+ * 受保护路径清单（按「改坏之后的后果」分类，不追求覆盖全）。
+ * 刻意**不**包含 /etc 全体、/usr/local —— 那是常规运维落点，全禁会让 Agent 报废。
+ */
+const PROTECTED_PATH_RE = new RegExp(
+  [
+    // 账号 / 提权
+    "^/etc/(?:passwd|shadow|gshadow|group)$",
+    "^/etc/sudoers(?:\\.d(?:/|$)|$)",
+    "^/etc/pam\\.d(?:/|$)",
+    // SSH 登录入口
+    "^/etc/ssh/sshd_config$",
+    "^/etc/ssh/ssh_host_",
+    // 引导 / 挂载
+    "^/boot(?:/|$)",
+    "^/etc/(?:fstab|crypttab)$",
+    "^/etc/default/grub$",
+    // 动态链接器预加载（经典 rootkit 落点）
+    "^/etc/ld\\.so\\.preload$",
+    "^/etc/ld\\.so\\.conf(?:\\.d)?(?:/|$)",
+    // 定时任务 / 服务单元
+    "^/var/spool/cron(?:/|$)",
+    "^/etc/cron(?:\\.[a-z]+)?(?:/|$)",
+    "^/etc/systemd/system(?:/|$)",
+    "^/usr/lib/systemd/system(?:/|$)",
+  ].join("|")
+);
+
+/**
+ * 允许「写入但必须确认」的系统服务单元目录。
+ *
+ * `/etc/systemd/system` 与 `/usr/lib/systemd/system` 必须分开对待：
+ * - `/usr/lib/systemd/system` 是**发行版包管理器的领地**：写进去会被包升级覆盖，
+ *   或者直接弄坏系统自带服务（sshd / NetworkManager）→ 保持硬拦。
+ * - `/etc/systemd/system` 恰恰是**留给管理员放自定义单元**的地方：`Xvnc.service`、
+ *   自研服务、`xxx.service` 都放这里。对这个目录一刀切硬拦的后果实测很明确 ——
+ *   部署 VNC / 自研服务这类最常见的运维任务永远做不了，模型只能把命令抄进
+ *   总结的「需要手动执行的操作」，用户再让它做一遍它还是抄一遍（因为它按规则
+ *   认为"再试也是被拦"），表现出来就是「不给操作、答非所问」。
+ *
+ * 但服务单元等价于「以 root 执行的任意命令」（`ExecStart=`），所以这里**只降级到
+ * 强制确认**，不放行到自动执行：`requireConfirmation` 一定为 true，中危自动开关
+ * 也绕不过去。
+ */
+const WRITABLE_UNIT_DIR_RE = /^\/etc\/systemd\/system\/[^/]/;
+
+/** 该路径是否属于「可写但需确认」的自定义服务单元 */
+export function isWritableSystemUnit(p: string): boolean {
+  const path = normalizePath(p);
+  if (!path) return false;
+  return WRITABLE_UNIT_DIR_RE.test(path);
+}
+
+/** 是否是受保护路径（含任意位置下的 .ssh 目录） */
+export function isProtectedPath(p: string): boolean {
+  const path = normalizePath(p);
+  if (!path) return false;
+  if (/(?:^|\/)\.ssh(?:\/|$)/.test(path)) return true;
+  return PROTECTED_PATH_RE.test(path);
+}
+
+/**
+ * 该片段会「写」哪些路径。
+ *
+ * 只认命令的显式写语义：重定向 / tee / dd、删除类、复制移动类（取目的地）、
+ * 改权限类（取被改对象）、`sed -i`（取文件）。解析不出来就返回空 ——
+ * 宁可漏拦（还有 high/critical 确认兜底），也不要把只读命令误判成写。
+ */
+function writtenTargetsOf(seg: CommandSegment): string[] {
+  const { bin } = seg;
+  const pos = seg.args.filter((a) => !isFlag(a)).map(stripQuotes);
+
+  if (hasWriteRedirect(seg) || bin === "tee" || bin === "dd") {
+    const t = extractWriteTargets(seg);
+    if (t.length > 0) return t;
+  }
+
+  switch (bin) {
+    case "rm":
+    case "rmdir":
+    case "unlink":
+    case "shred":
+    case "truncate":
+    case "patch":
+    case "tee":
+      return pos;
+    case "mv":
+      // 移动 = 源位置被移走（原文件没了）+ 目的地被覆盖，两边都算写。
+      // 只取目的地会漏掉 `mv /etc/fstab /etc/fstab.bak` 这种「移走系统文件」的破坏。
+      return pos;
+    case "cp":
+    case "install":
+    case "ln":
+    case "rsync":
+    case "scp":
+      // 目的地是最后一个位置参数（源只是被读）
+      return pos.length > 1 ? [pos[pos.length - 1]] : [];
+    case "chmod":
+    case "chown":
+    case "chgrp":
+    case "setfacl":
+      return pos.length > 1 ? pos.slice(1) : [];
+    case "sed":
+      // `sed -i 's/a/b/' 文件`：首项是脚本表达式，不是文件
+      return /-i\b|--in-place/.test(seg.raw) ? pos.slice(1) : [];
+    default:
+      return [];
+  }
+}
+
+/**
+ * 命令里是否有针对受保护路径的写操作；返回命中的路径（已去重）。
+ *
+ * 注意这里只做**静态文本**判断：`python -c "open('/etc/passwd','w')"` 这类
+ * 藏在解释器字符串里的写不会命中 —— 那由下面的「解释器内联代码」规则抬到 medium，
+ * 并靠 high 确认兜底。两者叠加已能覆盖真实场景，不要为此去解析语言 AST。
+ */
+export function protectedWriteHits(command: string): string[] {
+  const cleaned = stripHeredocs((command ?? "").trim());
+  if (!cleaned) return [];
+  const hits = new Set<string>();
+  for (const seg of splitTopLevel(cleaned).map(parseSegment)) {
+    if (!seg.bin) continue;
+    for (const t of writtenTargetsOf(seg)) {
+      if (isProtectedPath(t)) hits.add(stripQuotes(t));
+    }
+  }
+  return [...hits];
+}
+
+/**
+ * 「读出来就等于泄露」的文件：内容本身是凭证，读一次就进了模型上下文/日志。
+ * 与受保护路径分开：`/etc/passwd` 读是正常诊断，`/etc/shadow` 读是拿哈希去爆破。
+ */
+const SECRET_FILE_RE =
+  /^\/etc\/(?:shadow|gshadow)$|(?:^|\/)\.ssh\/id_[A-Za-z0-9_]+$|\.(?:p12|pfx|jks)$/;
+
+/** 会「把文件内容搬到别处」的命令（读、打印、复制、打包都算） */
+const READ_OR_COPY_BIN = new Set([
+  "cat", "tac", "head", "tail", "less", "more", "nl", "strings", "xxd", "od", "hexdump",
+  "base64", "grep", "egrep", "zgrep", "awk", "cut", "sort", "uniq", "diff", "cp", "scp",
+  "rsync", "tar", "zip", "gzip", "tee", "python", "python3", "perl", "node",
+]);
+
+/**
+ * 命令是否在读取凭证类文件；返回命中的路径。
+ *
+ * 注意：`/etc/passwd` 不在清单里 —— 它是常规诊断对象（看用户/家目录/登录 shell）。
+ * `id_rsa.pub` 也不算（公钥，可公开）。
+ */
+export function secretReadHits(command: string): string[] {
+  const cleaned = stripHeredocs((command ?? "").trim());
+  if (!cleaned) return [];
+  const hits = new Set<string>();
+  for (const seg of splitTopLevel(cleaned).map(parseSegment)) {
+    if (!seg.bin || !READ_OR_COPY_BIN.has(seg.bin)) continue;
+    for (const a of seg.args) {
+      if (isFlag(a)) continue;
+      const p = normalizePath(a);
+      // 公钥放行
+      if (/\.pub$/.test(p)) continue;
+      if (SECRET_FILE_RE.test(p)) hits.add(stripQuotes(a));
+    }
+  }
+  return [...hits];
+}
+
+/**
+ * 敏感信息脱敏（密码 / token / 私钥 / 云密钥）。
+ *
+ * 为什么要做：终端的原始输出里经常带着 `--password xxx`、`Authorization: Bearer xxx`、
+ * 连接串 `mysql://user:pass@host`，这些内容一旦进入模型上下文，就等于上传到第三方；
+ * 而它们对诊断毫无价值 —— 模型只需要知道「有密码这一项」，不需要知道具体值。
+ *
+ * 只在「读文件」的命令上做会漏（用户手敲的命令回显也带密码），所以放在输出清洗环节统一做。
+ */
+const SECRET_RULES: Array<[RegExp, string]> = [
+  // 私钥块：整段内容都不该出现
+  [
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+    "-----BEGIN PRIVATE KEY-----（私钥内容已隐藏）-----END PRIVATE KEY-----",
+  ],
+  // HTTP 认证头
+  [
+    /\b(Authorization\s*:\s*)(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+    "$1***",
+  ],
+  // key=value / key: value。键名允许带前缀（DB_PASSWORD / MYSQL_ROOT_PASSWORD /
+  // GITHUB_TOKEN 都常见），否则 `\bpassword\b` 匹配不到下划线连写的名字。
+  [
+    /([A-Za-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)[A-Za-z0-9_]*)(\s*[=:]\s*)("[^"]{1,200}"|'[^']{1,200}'|[^\s;,&|]{1,200})/gi,
+    "$1$2***",
+  ],
+  // 命令行参数形态：--password xxx / --token=xxx
+  [
+    /(--password|--passwd|--token|--api-key|--secret)(\s+|=)("[^"]{1,200}"|'[^']{1,200}'|\S{1,200})/gi,
+    "$1$2***",
+  ],
+  // 连接串里的口令：scheme://user:pass@host
+  [/(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)([^\s@/]{1,200})(@)/gi, "$1***$3"],
+  // 云/AI 平台密钥
+  [/\bAKIA[0-9A-Z]{16}\b/g, "AKIA***"],
+  [/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "gh***"],
+  [/\bsk-[A-Za-z0-9]{20,}\b/g, "sk-***"],
+];
+
+export function redactSecrets(text: string): string {
+  let out = text ?? "";
+  for (const [re, rep] of SECRET_RULES) out = out.replace(re, rep);
+  return out;
 }
 
 function reviewSegment(seg: CommandSegment): SegmentVerdict | null {
@@ -660,6 +977,7 @@ function reviewSegment(seg: CommandSegment): SegmentVerdict | null {
   let confirm: string[] = [];
   let alternative: string | undefined;
   let matched = false;
+  let forceConfirm = false;
 
   const take = (r: RiskLevel, desc: string, conf?: string[], alt?: string) => {
     if (rank(r) > rank(risk) || !matched) {
@@ -679,6 +997,7 @@ function reviewSegment(seg: CommandSegment): SegmentVerdict | null {
   for (const rule of DANGEROUS_RULES) {
     if (rule.pattern.test(seg.raw)) {
       take(rule.risk, rule.description, rule.confirm, rule.alternative);
+      if (rule.forceConfirm) forceConfirm = true;
     }
   }
 
@@ -710,7 +1029,7 @@ function reviewSegment(seg: CommandSegment): SegmentVerdict | null {
     return { risk: "none", description: "只读查询命令，无副作用", confirm: [] };
   }
   if (ro === "none") {
-    return { risk, description, confirm, alternative };
+    return { risk, description, confirm, alternative, ...(forceConfirm ? { forceConfirm: true } : {}) };
   }
 
   // 4) 写操作：按落点定级
@@ -749,7 +1068,7 @@ function reviewSegment(seg: CommandSegment): SegmentVerdict | null {
   }
 
   if (risk === "none" && !matched) return null;
-  return { risk, description, confirm, alternative };
+  return { risk, description, confirm, alternative, ...(forceConfirm ? { forceConfirm: true } : {}) };
 }
 
 /** 会把文件内容整段倒进 stdout 的命令（`cat` 一个二进制 = 上百 MB 乱码刷屏） */
@@ -779,6 +1098,26 @@ export function isBinaryDumpCommand(command: string): boolean {
   return DUMP_BIN_RE.test(command) && BINARY_PATH_RE.test(command);
 }
 
+/** 终端提示符（`[root@mgt signature]#`、`root@mgt:~#`）位于行首 */
+const PROMPT_PREFIX_RE =
+  /^(?:\[[^\]\n]{0,80}\][#$]|[\w.-]{1,40}@[\w.-]{1,80}:[^#$]{0,80}[#$])(?:\s|$)/;
+
+/**
+ * 这条「命令」其实是终端回显碎片，不是命令。
+ *
+ * 实测（`agent-runs/...` 的 001 步）：模型把终端画面按字符重放了一遍，
+ * 下发的是 `[root@mgt signature]#`、`r`、`m`、`r`、`f` 六个片段，六次
+ * `command not found`(127)、白烧一轮。这类片段永远不会执行成功，还会把
+ * 观察预算和台账冲掉，所以在准入阶段直接拦下。
+ */
+export function isEchoFragment(command: string): boolean {
+  const cmd = (command ?? "").trim();
+  if (!cmd) return true;
+  // 单字符（`r` / `m`）：真实命令最短也有 2 个字符（`ls`、`cd`、`df`）
+  if (/^[A-Za-z]$/.test(cmd)) return true;
+  return PROMPT_PREFIX_RE.test(cmd);
+}
+
 /**
  * 命令安全审查（本地规则，不依赖 AI）
  */
@@ -800,15 +1139,71 @@ export function reviewCommand(command: string, opts?: {
   }
 
   const cleaned = stripHeredocs(cmd);
+
+  // 受保护路径的写操作：最先判定，直接拒绝（不给确认、也不走后面的只读分支）。
+  // 放在这里是为了防绕过：`sed -i ... /etc/passwd`、`echo x > /root/.ssh/authorized_keys`
+  // 都必须命中，而不是被「sed 是只读命令」或「echo 是只读命令」判成低危。
+  const protectedHits = protectedWriteHits(cleaned);
+  // 服务单元目录单独分流：`/etc/systemd/system` 下属于「可写但必须确认」，
+  // 其余（提权 / SSH / 引导 / cron / `/usr/lib/systemd/system`）照旧直接拒绝。
+  const unitHits = protectedHits.filter(isWritableSystemUnit);
+  const hardHits = protectedHits.filter((p) => !isWritableSystemUnit(p));
+  if (hardHits.length > 0) {
+    const list = hardHits.slice(0, 3).join("、");
+    return {
+      command,
+      riskLevel: "critical",
+      isSafe: false,
+      // 关键：不弹确认。用户的要求是「这类路径默认不做任何操作」，
+      // 让用户在一个高危弹窗上点「执行」等于把风险又推回给人。
+      requireConfirmation: false,
+      blocked: true,
+      blockedReason:
+        `这条命令会写入受保护路径（${list}）。这类文件（账号/提权、SSH 登录、引导、` +
+        `动态链接预加载、定时任务、发行版自带服务单元）一旦被改，轻则服务异常，` +
+        `重则永久登不进机器，而 Agent 无法在事后确认改动是否正确。\n` +
+        `接管期间对这类路径**一律不执行**（不是等确认，是直接不做），换任何写法` +
+        `（\`sed -i\` / \`tee\` / 重定向 / \`python -c\` 打开文件）同样会被拦。\n` +
+        `请把这条命令原样写进最终总结的「需要手动执行的操作」，由人工执行。`,
+      riskDescription: `受保护路径写操作（${list}）`,
+      confirmationItems: [],
+    };
+  }
+
   const segments = splitTopLevel(cleaned).map(parseSegment).filter((s) => s.bin);
+
+  // 凭证类文件的「读」同样拒绝：内容本身是密码哈希/私钥，读一次就进了上下文与日志。
+  // 与上面的写拦截分开写文案 —— 「不要改」和「不要读出来」是两种不同的动作。
+  const secretHits = secretReadHits(cleaned);
+  if (secretHits.length > 0) {
+    const list = secretHits.slice(0, 3).join("、");
+    return {
+      command,
+      riskLevel: "critical",
+      isSafe: false,
+      requireConfirmation: false,
+      blocked: true,
+      blockedReason:
+        `这条命令读取的是凭证类文件（${list}）—— 内容是密码哈希或私钥，` +
+        `一旦输出到终端就会进入 AI 上下文与日志，等于把凭据交出去。\n` +
+        `接管期间**不读取这类文件**（不是等确认，是直接不做）。\n` +
+        `要确认权限配置是否正确，请查元数据而不是内容：\`ls -l 路径\`、\`stat -c '%a %U:%G' 路径\`。` +
+        `确实需要看内容时，请写进总结的「需要手动执行的操作」由人工处理。`,
+      riskDescription: `读取凭证文件（${list}）`,
+      confirmationItems: [],
+    };
+  }
 
   let risk: RiskLevel = "none";
   let description = "";
   let confirmItems: string[] = [];
   let alternative: string | undefined;
   let found = false;
+  // 写自定义服务单元一律要人工确认（等价于「以 root 执行的任意命令」）
+  let forceConfirmHit = unitHits.length > 0;
 
   const consider = (v: SegmentVerdict) => {
+    if (v.forceConfirm) forceConfirmHit = true;
     if (rank(v.risk) > rank(risk)) {
       risk = v.risk;
       description = v.description;
@@ -829,6 +1224,7 @@ export function reviewCommand(command: string, opts?: {
         confirmItems = rule.confirm ? [...rule.confirm] : [];
         alternative = rule.alternative;
       }
+      if (rule.forceConfirm) forceConfirmHit = true;
       found = true;
     }
   }
@@ -843,11 +1239,29 @@ export function reviewCommand(command: string, opts?: {
     description = "非常见命令，请确认命令意图";
   }
 
+  // 写自定义服务单元（`/etc/systemd/system/*.service`）：抬到 medium 并强制确认。
+  // 放在各个判定之后、计算 requireConfirmation 之前 —— 否则会被 consider() 里
+  // 「风险更高者覆盖」的逻辑把 add 的确认项冲掉。
+  if (unitHits.length > 0) {
+    if (rank(risk) < rank("medium")) {
+      risk = "medium";
+      description = "创建 / 修改 systemd 服务单元";
+    }
+    confirmItems = [
+      `写入服务单元：${unitHits.slice(0, 3).join("、")}`,
+      "服务单元的 ExecStart 会以 root 身份执行，确认前请核对命令内容",
+      ...confirmItems,
+    ];
+  }
+
   // 生产环境：只要不是只读，一律二次确认（与改动前的行为保持一致 ——
   // 重写判定后「写 /data 下文件」从 medium 降为 low，若这里仍只看 medium，
   // 生产主机上的写操作就会从「需确认」悄悄变成「直接执行」）。
   const isProd = !!opts?.isProduction;
-  const requireConfirmation = rank(risk) >= rank("high") || (isProd && rank(risk) >= rank("low"));
+  // forceConfirmHit：内容不可静态审查的形态（解释器内联代码）即使只判 medium
+  // 也必须人工确认 —— 否则「中危自动执行」开关一开，等于让模型绕过所有本地规则。
+  const requireConfirmation =
+    rank(risk) >= rank("high") || forceConfirmHit || (isProd && rank(risk) >= rank("low"));
 
   if (isProd && rank(risk) >= rank("low")) {
     confirmItems = ["⚠️ 当前主机已标注【生产环境】", ...confirmItems];

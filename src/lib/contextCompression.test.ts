@@ -11,6 +11,7 @@ import {
   buildCompressionMessages,
   assembleCompressedMessages,
   trimMessages,
+  estimateContextWindow,
   SUMMARY_MARKER,
   SUMMARY_MAX_CHARS,
   type ChatMessage,
@@ -144,6 +145,12 @@ describe("buildCompressionMessages", () => {
     assert.ok(/EXACT/.test(msgs[0].content), "应要求命令保持原文");
     assert.ok(/UNRESOLVED/.test(msgs[0].content), "应强调未解决错误");
   });
+
+  test("提示词要求单列「已排除的假设」，避免压缩后重复失败过的尝试", () => {
+    const msgs = buildCompressionMessages({ goal: "g", transcript: "t" });
+    assert.ok(msgs[0].content.includes("## 已排除的假设"));
+    assert.ok(/FAILED/.test(msgs[0].content), "必须明确这是「试过且失败」的方法");
+  });
 });
 
 describe("assembleCompressedMessages", () => {
@@ -214,5 +221,54 @@ describe("trimMessages（硬截断兜底）", () => {
     const msgs = [sys("SYS"), user("旧"), user("新")];
     const out = trimMessages(msgs, 1);
     assert.deepStrictEqual(out.map((m) => m.content), ["SYS", "新"]);
+  });
+
+  test("给出 token 预算时按预算收口，而不是固定条数", () => {
+    // 实测故障：41 条 40205 token，按条数截断后仍有 29157 token，
+    // 阈值写着 28k 却照样超 —— 小窗口模型（8k/16k）直接 400。
+    const big = "x".repeat(4000);
+    const msgs: ChatMessage[] = [
+      sys("SYS"),
+      ...Array.from({ length: 40 }, (_, i) => user(`${i}:${big}`)),
+    ];
+    const out = trimMessages(msgs, 29, "目标", 10000);
+    assert.ok(
+      estimateMessagesTokens(out) <= 10000,
+      `必须收进预算内，实际 ${estimateMessagesTokens(out)}`
+    );
+    assert.ok(out.length < msgs.length, "确实发生了截断");
+    // 同时断言宽松判据：不传预算时行为不变（按条数），避免把老调用方一起改坏
+    const byCount = trimMessages(msgs, 29, "目标");
+    // system + 目标 + 最近 29 条 = 31
+    assert.equal(byCount.length, 31);
+    assert.ok(estimateMessagesTokens(byCount) > 10000);
+  });
+
+  test("预算小于单条内容时仍保留最后一条", () => {
+    // 全砍光会让模型看不到「刚刚那轮发生了什么」，于是重发同一条命令。
+    const msgs = [sys("SYS"), user("y".repeat(40000))];
+    const out = trimMessages(msgs, 5, undefined, 100);
+    assert.equal(out[out.length - 1].content.length, 40000);
+  });
+});
+
+describe("estimateContextWindow", () => {
+  test("模型名自带窗口声明时以它为准", () => {
+    assert.equal(estimateContextWindow({ model: "some-local-model-32k" }), 32768);
+  });
+
+  test("本地推理服务按 8192 估（ollama/llama.cpp 常见 n_ctx）", () => {
+    assert.equal(estimateContextWindow({ model: "qwen3.5:9b", baseUrl: "http://localhost:11434/v1" }), 8192);
+    assert.equal(estimateContextWindow({ model: "x", baseUrl: "http://127.0.0.1:8000/v1" }), 8192);
+  });
+
+  test("gpt-3.5-turbo 按 16k 估，主流大窗口模型不误伤", () => {
+    assert.equal(estimateContextWindow({ model: "gpt-3.5-turbo", baseUrl: "https://api.openai.com" }), 16385);
+    // 宽松判据：gpt-4o / claude 这类必须保持大窗口，不能被下调策略误判成 8k
+    assert.equal(estimateContextWindow({ model: "gpt-4o", baseUrl: "https://api.openai.com" }), 128000);
+    assert.equal(
+      estimateContextWindow({ model: "claude-3-5-sonnet", baseUrl: "https://api.anthropic.com" }),
+      128000
+    );
   });
 });

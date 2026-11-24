@@ -1,0 +1,4 @@
+﻿TermAI pid=62392 path=C:\Users\raotengke\AppData\Local\Programs\TermAI\TermAI.exe
+TermAI pid=62440 path=C:\Users\raotengke\AppData\Local\Programs\TermAI\TermAI.exe
+TermAI pid=69964 path=C:\Users\raotengke\AppData\Local\Programs\TermAI\TermAI.exe
+TermAI pid=71408 path=C:\Users\raotengke\AppData\Local\Programs\TermAI\TermAI.exe

@@ -64,6 +64,9 @@ export const CommandCard = memo(function CommandCard({ command, sessionId, sessi
 
   const handleRun = () => {
     if (!runnable) return;
+    // 受保护路径 / 凭证文件：一律不执行（不是「弹窗问一下」，是直接拒绝）。
+    // 这里必须拦住，否则用户在卡片上一点「执行」，就绕过了接管期间的同一套策略。
+    if (review.blocked) return;
     if (review.requireConfirmation) {
       setShowConfirm(true);
       return;
@@ -114,13 +117,15 @@ export const CommandCard = memo(function CommandCard({ command, sessionId, sessi
           </button>
           <button
             onClick={handleRun}
-            disabled={!sessionConnected || !runnable}
+            disabled={!sessionConnected || !runnable || !!review.blocked}
             title={
-              !runnable
-                ? "该代码块是文件内容/说明文本，不是可执行命令，请复制后自行使用"
-                : sessionConnected
-                  ? "在终端执行此命令"
-                  : "请先连接主机"
+              review.blocked
+                ? "该命令涉及受保护路径/凭证文件，接管期间不执行"
+                : !runnable
+                  ? "该代码块是文件内容/说明文本，不是可执行命令，请复制后自行使用"
+                  : sessionConnected
+                    ? "在终端执行此命令"
+                    : "请先连接主机"
             }
             className="px-2 py-1 text-[11px] rounded bg-success hover:bg-success-hover disabled:bg-bg-hover disabled:text-text-tertiary disabled:cursor-not-allowed text-white flex items-center gap-1"
           >
@@ -143,10 +148,19 @@ export const CommandCard = memo(function CommandCard({ command, sessionId, sessi
         </pre>
       )}
 
+      {/* 受保护路径：不给「执行」按钮留后路，必须说清为什么按不动 */}
+      {review.blocked && (
+        <div className="px-3 py-2 text-xs text-white/80 border-t border-red-500/30 bg-red-950/50 flex items-start gap-2">
+          <ShieldAlert size={14} className="text-red-400 mt-0.5 flex-shrink-0" />
+          <div className="whitespace-pre-line leading-relaxed">{review.blockedReason}</div>
+        </div>
+      )}
+
       {/* 只有中危及以上才提示：只读/低危命令挂一个黄色警告条纯属噪音 */}
-      {(effectiveRisk === "medium" ||
-        effectiveRisk === "high" ||
-        effectiveRisk === "critical") &&
+      {!review.blocked &&
+        (effectiveRisk === "medium" ||
+          effectiveRisk === "high" ||
+          effectiveRisk === "critical") &&
         review.riskDescription && (
         <div className="px-3 py-2 text-xs text-white/80 border-t border-white/10 bg-black/20 flex items-start gap-2">
           <AlertTriangle size={14} className="text-yellow-400 mt-0.5 flex-shrink-0" />

@@ -51,12 +51,14 @@ interface Props {
 
 export function SessionPlayer({ open, onClose }: Props) {
   const appTheme = useAppConfig((c) => c.theme);
-  const resolvedTheme =
-    appTheme === "system"
-      ? window.matchMedia("(prefers-color-scheme: dark)").matches
-        ? "dark"
-        : "light"
-      : appTheme;
+  const resolvedTheme: "dark" | "light" =
+    appTheme === "xshell"
+      ? "dark"
+      : appTheme === "system"
+        ? window.matchMedia("(prefers-color-scheme: dark)").matches
+          ? "dark"
+          : "light"
+        : appTheme;
 
   const [items, setItems] = useState<RecordingMeta[]>([]);
   const [loading, setLoading] = useState(false);

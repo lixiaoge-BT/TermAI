@@ -116,11 +116,13 @@ Rules:
 ## 已完成步骤
 ## 关键事实
 ## 错误与解决
+## 已排除的假设
 ## 当前状态
 ## 待办
 - 已完成步骤: each executed command with its short outcome (exit code or one-line result). Keep commands EXACT — never paraphrase shell syntax, flags, or paths.
 - 关键事实: concrete values later steps depend on — absolute file paths, ports, IPs, hostnames, versions, package names, users, PIDs, config values, URLs.
 - 错误与解决: command + exact error message + whether resolved. Keep UNRESOLVED errors prominent and explicit.
+- 已排除的假设: approaches that were tried and FAILED, and wrong guesses that were ruled out (e.g. "not a permission problem: same EPERM with sudo"). This is the most valuable section for avoiding repeats — a later step must not retry what already failed. If nothing was ruled out, write "（无）".
 - 当前状态: what is true right now (services running, files modified, current directory, installed versions).
 - 待办: what remains to reach the goal.
 - Merge carefully: carry forward previous-summary facts that are still relevant; drop facts that were superseded.
@@ -180,19 +182,80 @@ export function assembleCompressedMessages(input: {
 
 /**
  * 硬截断兜底：压缩失败或摘要不给力时使用。保留 system + 目标 + 最近若干轮。
+ *
+ * `maxTokens` 给出时，保留范围从**最新一条往前**累加到预算为止，不再只看条数。
+ * 为什么必须这样：一条 8000 字符的观察 ≈ 2000+ token，按「保留 29 条」截断后
+ * 仍有 5 万 token —— 阈值写着 28k、实际能到 29k 以上，上下文窗口小的模型
+ * （本地 8k/16k、gpt-3.5-turbo 16k）会直接 400，且报错发生在请求层，
+ * 界面上只表现为「AI 一直没反应」。条数只是粗略代理，token 才是真实占用。
  */
 export function trimMessages(
   messages: ChatMessage[],
   keepRecent: number,
-  goal?: string
+  goal?: string,
+  maxTokens?: number
 ): ChatMessage[] {
+  if (messages.length === 0) return [];
   const system = messages[0];
-  const recent = messages.slice(-keepRecent);
-  const out: ChatMessage[] = [system];
+  let recent = messages.slice(-Math.max(1, keepRecent));
   const g = goal?.trim();
+
+  if (maxTokens && maxTokens > 0) {
+    // system 与目标文本是必留项，先把它们的开销从预算里扣掉，
+    // 否则「保留最近若干轮」会把预算吃光，连任务目标都塞不进去。
+    let budget =
+      maxTokens -
+      estimateTokens(system.content) -
+      PER_MESSAGE_OVERHEAD -
+      (g ? estimateTokens(g) + PER_MESSAGE_OVERHEAD : 0);
+    const kept: ChatMessage[] = [];
+    for (let i = recent.length - 1; i >= 0; i--) {
+      const cost = estimateTokens(recent[i].content) + PER_MESSAGE_OVERHEAD;
+      // 至少保留最后一条：它是「刚刚发生了什么」，丢了模型会重发同一条命令。
+      if (kept.length > 0 && cost > budget) break;
+      kept.unshift(recent[i]);
+      budget -= cost;
+    }
+    recent = kept.length > 0 ? kept : recent.slice(-1);
+  }
+
+  const out: ChatMessage[] = [system];
   if (g && !recent.some((m) => m.content === g)) {
     out.push({ role: "user", content: g });
   }
   out.push(...recent);
   return out;
+}
+
+/**
+ * 保守估算模型的输入窗口（token）。**只下调、不上调**：认不出就按大窗口处理，
+ * 宁可多压一次也不要把正常任务砍成残废。
+ *
+ * 背景：压缩/硬截断阈值原本写死 28k，对 128k 模型绰绰有余，但对 16k 甚至 8k 的
+ * 模型是直接 400 —— 而且报错在请求层，界面只显示「AI 一直没反应」，极难排查。
+ */
+export function estimateContextWindow(opts: {
+  model?: string;
+  baseUrl?: string;
+}): number {
+  const model = (opts.model ?? "").toLowerCase();
+  const baseUrl = (opts.baseUrl ?? "").toLowerCase();
+
+  // 模型名自带窗口声明时以它为准（如 `xxx-128k`、`xxx-32k`）。
+  const declared = model.match(/(\d{2,3})k\b/);
+  if (declared) {
+    const k = Number(declared[1]);
+    if (k >= 4 && k <= 1000) return k * 1024;
+  }
+
+  // 本地/自建推理服务：ollama 默认 n_ctx 4096，llama.cpp 2048，vLLM 常按 8k 部署。
+  // 按 8192 估是偏保守的中位值。
+  const isLocal = /(?:localhost|127\.0\.0\.1|0\.0\.0\.0|::1|host\.docker\.internal)/.test(baseUrl);
+  if (isLocal) return 8192;
+
+  // 明确的小窗口模型
+  if (/gpt-3\.5-turbo(?!-16k)/.test(model)) return 16385;
+
+  // 其余（gpt-4 系列 / claude / deepseek / qwen / glm / kimi 等）主流都是 64k~128k
+  return 128000;
 }

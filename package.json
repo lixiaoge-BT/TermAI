@@ -73,7 +73,14 @@
     "directories": {
       "output": "release/${version}"
     },
-    "asar": true,
+    "asar": {
+      "smartUnpack": false
+    },
+    "electronLanguages": [
+      "zh-CN",
+      "zh-TW",
+      "en-US"
+    ],
     "afterPack": "scripts/afterPack.mjs",
     "files": [
       "dist",
@@ -88,11 +95,32 @@
       "!node_modules/ssh2/.github/**",
       "!node_modules/ssh2/examples/**",
       "!**/*.map",
-      "!node_modules/node-pty/deps/**"
+      "!node_modules/node-pty/deps/**",
+      "!node_modules/node-pty/third_party/**",
+      "!node_modules/node-pty/src/**",
+      "!node_modules/node-pty/scripts/**",
+      "!node_modules/node-pty/lib/*.test.js",
+      "!node_modules/node-pty/node_modules/**",
+      "!node_modules/node-pty/prebuilds/darwin-*/**",
+      "!node_modules/node-pty/prebuilds/win32-arm64/**",
+      "!node_modules/react/**",
+      "!node_modules/react-dom/**",
+      "!node_modules/react-router/**",
+      "!node_modules/react-router-dom/**",
+      "!node_modules/scheduler/**",
+      "!node_modules/loose-envify/**",
+      "!node_modules/js-tokens/**",
+      "!node_modules/cookie/**",
+      "!node_modules/set-cookie-parser/**",
+      "!node_modules/lucide-react/**",
+      "!node_modules/xterm/**",
+      "!node_modules/xterm-addon-fit/**",
+      "!node_modules/@xterm/**",
+      "!node_modules/zustand/**",
+      "!node_modules/clsx/**",
+      "!node_modules/tailwind-merge/**"
     ],
     "asarUnpack": [
-      "node_modules/ssh2/**",
-      "node_modules/cpu-features/**",
       "node_modules/node-pty/**"
     ],
     "npmRebuild": false,
@@ -136,7 +164,9 @@
       "perMachine": false,
       "unicode": true,
       "deleteAppDataOnUninstall": false,
-      "differentialPackage": false
+      "differentialPackage": false,
+      "include": "build/installer.nsh",
+      "runAfterFinish": true
     },
     "mac": {
       "target": [

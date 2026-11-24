@@ -117,6 +117,14 @@ const sshApi = {
     ipcRenderer.invoke("ssh:resize", sessionId, cols, rows) as Promise<boolean>,
   listSessions: () =>
     ipcRenderer.invoke("ssh:list-sessions") as Promise<SshSessionInfo[]>,
+  /** 独立通道执行（不占 PTY、不进终端画面）：资源采样等高频只读场景专用 */
+  exec: (sessionId: string, command: string, timeoutMs?: number) =>
+    ipcRenderer.invoke("ssh:exec", sessionId, command, timeoutMs) as Promise<{
+      stdout: string;
+      stderr: string;
+      code: number | null;
+      timeout?: boolean;
+    }>,
   forwardLocal: (sessionId: string, spec: SshForwardSpec) =>
     ipcRenderer.invoke("ssh:forward-local", sessionId, spec) as Promise<SshForwardStatus>,
   forwardRemote: (sessionId: string, spec: SshForwardSpec) =>
@@ -269,6 +277,71 @@ export interface RecordingMeta {
   title?: string;
 }
 
+// =====================================================
+// Agent 任务记录与导出
+// -----------------------------------------------------
+// begin/append/finish 是「全量输出落盘」通道：store 里每条命令的输出被截断到
+// 4000 字符供 UI 渲染，完整文本通过 append 落到 userData/agent-runs/<runId>/outputs。
+// save 是导出：弹原生目录选择框，把报告/台账/表格/完整输出写到你选的位置。
+// 所有方法都做了容错，落盘失败返回 { ok:false }，不抛异常干扰任务主流程。
+// =====================================================
+
+/** 一次 Agent 任务的元信息 */
+export interface AgentRunMeta {
+  runId: string;
+  sessionId?: string;
+  goal: string;
+  host?: string;
+  user?: string;
+  startedAt: number;
+}
+
+export interface AgentRunAppendInput {
+  runId: string;
+  stepIndex: number;
+  itemIndex: number;
+  command: string;
+  risk?: string;
+  status?: string;
+  exitCode?: number | null;
+  timedOut?: boolean;
+  content: string;
+}
+
+export interface AgentExportInput {
+  defaultName: string;
+  files: { path: string; content: string; encoding?: "base64" }[];
+  runId?: string;
+}
+
+export interface AgentExportResult {
+  ok: boolean;
+  dir?: string;
+  canceled?: boolean;
+  error?: string;
+  fileCount?: number;
+}
+
+const agentRunApi = {
+  begin: (meta: AgentRunMeta) =>
+    ipcRenderer.invoke("agent-run:begin", meta) as Promise<{ runId: string; dir: string } | null>,
+  append: (input: AgentRunAppendInput) =>
+    ipcRenderer.invoke("agent-run:append", input) as Promise<{
+      ok: boolean;
+      file?: string;
+      skipped?: string;
+    }>,
+  finish: (patch: { runId: string; summary?: string; stepCount?: number; truncated?: boolean }) =>
+    ipcRenderer.invoke("agent-run:finish", patch) as Promise<void>,
+  dir: (runId: string) => ipcRenderer.invoke("agent-run:dir", runId) as Promise<string>,
+  outputs: (runId: string) => ipcRenderer.invoke("agent-run:outputs", runId) as Promise<string[]>,
+  /** 完整输出正文（文件名 → 内容）；导出时内联进 html/md/docx 用 */
+  readOutputs: (runId: string) =>
+    ipcRenderer.invoke("agent-run:read-outputs", runId) as Promise<Record<string, string>>,
+  save: (input: AgentExportInput) =>
+    ipcRenderer.invoke("agent-run:save", input) as Promise<AgentExportResult>,
+};
+
 const recordingsApi = {
   getDir: () => ipcRenderer.invoke("recording:get-dir") as Promise<string>,
   save: (input: { name: string; content: string; duration?: number }) =>
@@ -289,6 +362,7 @@ contextBridge.exposeInMainWorld("clipboard", clipboardApi);
 contextBridge.exposeInMainWorld("sftp", sftpApi);
 contextBridge.exposeInMainWorld("localFs", localFsApi);
 contextBridge.exposeInMainWorld("recordings", recordingsApi);
+contextBridge.exposeInMainWorld("agentRun", agentRunApi);
 
 // 暴露一个 ping 用于调试
 contextBridge.exposeInMainWorld("__termai_debug", {
@@ -318,4 +392,5 @@ export type SftpApi = typeof sftpApi;
 export type LocalFsApi = typeof localFsApi;
 export type SecureStorageApi = typeof secureStorageApi;
 export type RecordingsApi = typeof recordingsApi;
+export type AgentRunApi = typeof agentRunApi;
 export type JumpApi = typeof jumpApi;

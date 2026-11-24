@@ -1,6 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chatCompletionRaw, describeHttpStatus, thinkingDisableExtra } from "./ai";
+import {
+  chatCompletionRaw,
+  describeHttpStatus,
+  thinkingDisableExtra,
+  __resetThinkingFieldSupportForTest,
+} from "./ai";
 
 // 用一组字符串分块构造一个符合 Web ReadableStream 接口的伪响应体
 function fakeBody(chunks: string[]) {
@@ -181,7 +186,7 @@ test("401 不重试（一次失败就抛出）", async () => {
 // 否则引擎拿到残缺文本 → 解析不出命令 → 越跑越偏。
 // ---------------------------------------------------------------------------
 
-test("输出被 max_tokens 截断时 onMeta 上报 truncated", async () => {
+test("输出被 max_tokens 截断：上报 truncated，且拒绝把残片当成功", async () => {
   const saved = globalThis.fetch;
   globalThis.fetch = (async () => ({
     ok: true,
@@ -191,15 +196,54 @@ test("输出被 max_tokens 截断时 onMeta 上报 truncated", async () => {
   })) as unknown as typeof fetch;
   const metas: Array<{ finishReason?: string; truncated: boolean }> = [];
   try {
+    // 旧行为是把 "说到一半" 原样返回 —— 上层拿到半条命令还以为是成功，
+    // 于是每轮都被同样截断、还被误判成「模型不守协议」。
+    // 现在：截断一律抛 OutputBudgetError 触发「放大预算 + 关思考」重试；
+    // 重试后仍截断才向调用方报「输出额度被占满」。
+    await assert.rejects(
+      () =>
+        chatCompletionRaw({
+          config: baseConfig,
+          messages: [{ role: "user", content: "hi" }],
+          onMeta: (m) => metas.push(m),
+        }),
+      /输出额度/
+    );
+    // 即便最终失败，截断信息也必须先上报（调用方靠它区分「截断」与「网络错」）
+    assert.ok(metas.length >= 1);
+    assert.equal(metas[0].finishReason, "length");
+    assert.equal(metas[0].truncated, true);
+  } finally {
+    globalThis.fetch = saved;
+  }
+});
+
+test("截断后自动放大输出预算并重试成功", async () => {
+  const saved = globalThis.fetch;
+  let call = 0;
+  globalThis.fetch = (async () => {
+    call += 1;
+    const first = call === 1;
+    return {
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: { content: first ? "说到一半" : "完整结论" },
+            finish_reason: first ? "length" : "stop",
+          },
+        ],
+      }),
+    };
+  }) as unknown as typeof fetch;
+  try {
     const out = await chatCompletionRaw({
       config: baseConfig,
       messages: [{ role: "user", content: "hi" }],
-      onMeta: (m) => metas.push(m),
     });
-    assert.equal(out, "说到一半");
-    assert.equal(metas.length, 1);
-    assert.equal(metas[0].finishReason, "length");
-    assert.equal(metas[0].truncated, true);
+    assert.equal(out, "完整结论");
+    // 必须真的重试了一次（而不是把第一次的残片直接返回）
+    assert.equal(call, 2);
   } finally {
     globalThis.fetch = saved;
   }
@@ -423,6 +467,7 @@ test("extraBody 原样平铺进请求体", async () => {
 });
 
 test("网关拒绝 extraBody（400）时自动去掉该字段重试", async () => {
+  __resetThinkingFieldSupportForTest();
   const bodies: Array<Record<string, unknown>> = [];
   const saved = globalThis.fetch;
   globalThis.fetch = ((_url: string, init?: RequestInit) => {
@@ -447,18 +492,70 @@ test("网关拒绝 extraBody（400）时自动去掉该字段重试", async () =
     assert.equal(bodies.length, 2);
     assert.ok("enable_thinking" in bodies[0]);
     assert.ok(!("enable_thinking" in bodies[1]), "第二跳必须去掉被拒的字段");
+    // 探测只付一次代价：被拒之后，后续请求不应再带这个字段
+    assert.equal(thinkingDisableExtra("glm-4.6"), undefined, "被拒后应永久停发该字段");
   } finally {
     globalThis.fetch = saved;
+    __resetThinkingFieldSupportForTest();
   }
 });
 
-test("thinkingDisableExtra 只对 Qwen3 系生效", () => {
+test("thinkingDisableExtra：除原生 OpenAI 外一律尝试关思考", () => {
+  __resetThinkingFieldSupportForTest();
+  // 思考型模型（含不经 qwen3 命名的自建/中转部署）都要关：
+  // 每轮先烧上千 token 推理 = 首字延迟 30~60s + 容易把输出预算吃光。
   assert.deepEqual(thinkingDisableExtra("Qwen/Qwen3.5-4B"), { enable_thinking: false });
   assert.deepEqual(thinkingDisableExtra("qwen3-8b-instruct"), { enable_thinking: false });
-  assert.deepEqual(thinkingDisableExtra("Qwen/Qwen3-32B"), { enable_thinking: false });
-  // 非 Qwen3 模型不应被注入（避免给不认该字段的网关添乱）
+  assert.deepEqual(thinkingDisableExtra("deepseek-chat"), { enable_thinking: false });
+  assert.deepEqual(thinkingDisableExtra("glm-4.6"), { enable_thinking: false });
+  assert.deepEqual(thinkingDisableExtra("my-local-32b"), { enable_thinking: false });
+  // 原生 OpenAI 没这个字段，发了必 400，不能发
   assert.equal(thinkingDisableExtra("gpt-4o-mini"), undefined);
-  assert.equal(thinkingDisableExtra("deepseek-chat"), undefined);
+  assert.equal(thinkingDisableExtra("openai/gpt-4o"), undefined);
+  assert.equal(thinkingDisableExtra("o3-mini"), undefined);
+  assert.equal(thinkingDisableExtra(""), undefined);
+});
+
+test("网关拒绝过 enable_thinking 后不再发（避免每轮白付一次 400）", async () => {
+  __resetThinkingFieldSupportForTest();
+  const bodies: Array<Record<string, unknown>> = [];
+  const saved = globalThis.fetch;
+  globalThis.fetch = ((_url: string, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    bodies.push(body);
+    if ("enable_thinking" in body) {
+      return Promise.resolve({
+        ok: false,
+        status: 400,
+        json: async () => ({ error: { message: "unknown field" } }),
+      });
+    }
+    return Promise.resolve({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "ok" } }] }),
+    });
+  }) as unknown as typeof fetch;
+  const cfg = { ...baseConfig, model: "glm-4.6", extraBody: { enable_thinking: false } };
+  try {
+    // 第一次：带字段 → 400 → 去掉后成功
+    await chatCompletionRaw({
+      config: cfg,
+      messages: [{ role: "user", content: "hi" }],
+      timeouts: { totalMs: 5_000 },
+    });
+    bodies.length = 0;
+    // 第二次：调用方仍拿着烘好字段的 config（Agent 就是这样），必须自己剥掉
+    await chatCompletionRaw({
+      config: cfg,
+      messages: [{ role: "user", content: "hi" }],
+      timeouts: { totalMs: 5_000 },
+    });
+    assert.equal(bodies.length, 1, "第二次请求不该再吃一次 400");
+    assert.ok(!("enable_thinking" in bodies[0]), "被拒后不得再带该字段");
+  } finally {
+    globalThis.fetch = saved;
+    __resetThinkingFieldSupportForTest();
+  }
 });
 
 test("正常流式响应不受超时逻辑影响（回归保护）", async () => {

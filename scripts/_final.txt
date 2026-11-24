@@ -1,0 +1,7 @@
+﻿DisplayName=TermAI 0.1.0
+UninstallString="C:\Users\raotengke\AppData\Local\Programs\TermAI\Uninstall TermAI.exe" /currentuser
+DisplayIcon=C:\Users\raotengke\AppData\Local\Programs\TermAI\uninstallerIcon.ico
+InstallLocation=C:\Users\raotengke\AppData\Local\Programs\TermAI
+exe exists=True
+C:\Users\raotengke\Desktop\TermAI.lnk exists=True mtime=11/09/2026 10:36:13
+C:\Users\raotengke\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\TermAI.lnk exists=True mtime=11/09/2026 10:36:13

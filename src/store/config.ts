@@ -8,7 +8,7 @@ interface AppConfigState {
   hosts: HostConfig[];
   hostGroups: string[];
   aiConfig: AIProviderConfig;
-  theme: "dark" | "light" | "system";
+  theme: "dark" | "light" | "system" | "xshell";
   hostFormOpen: boolean;
   fileTransferHostId: string | null;
   forwardHostId: string | null;
@@ -21,7 +21,7 @@ interface AppConfigState {
   removeHostGroup: (name: string) => void;
 
   updateAIConfig: (patch: Partial<AIProviderConfig>) => void;
-  setTheme: (theme: "dark" | "light" | "system") => void;
+  setTheme: (theme: "dark" | "light" | "system" | "xshell") => void;
   setHostFormOpen: (open: boolean) => void;
   openFileTransfer: (hostId: string) => void;
   closeFileTransfer: () => void;
@@ -35,7 +35,7 @@ interface AppConfigState {
 }
 
 const defaultAIConfig: AIProviderConfig = {
-  provider: "openai",
+  provider: "custom",
   apiKey: "",
   baseUrl: "https://api.openai.com/v1",
   model: "gpt-4o-mini",
